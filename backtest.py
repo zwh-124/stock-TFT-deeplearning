@@ -7,6 +7,7 @@ from model import CompetitionTFT
 from dataset import StockDataset
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
+from plot import plot_backtest_nav
 import config
 
 
@@ -131,7 +132,22 @@ def main():
         num_heads=config.NUM_HEADS,
         dropout=config.DROPOUT,
     ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    ckpt = torch.load(model_path, map_location=device)
+    if isinstance(ckpt, dict) and 'config' in ckpt:
+        saved_cfg = ckpt['config']
+        for key, cur in {'USE_CSI300': config.USE_CSI300,
+                         'HIDDEN_DIM': config.HIDDEN_DIM,
+                         'SEQ_LEN': config.SEQ_LEN,
+                         'NUM_HEADS': config.NUM_HEADS,
+                         'PRED_HORIZON': config.PRED_HORIZON}.items():
+            saved = saved_cfg.get(key)
+            if saved is not None and saved != cur:
+                print(f"WARNING: config mismatch — {key}: "
+                      f"trained={saved}, current={cur}")
+        model.load_state_dict(ckpt['state_dict'])
+    else:
+        model.load_state_dict(ckpt)
 
     print("Generating predictions...")
     pred_df = generate_predictions(model, val_ds, device)
@@ -156,9 +172,13 @@ def main():
         print(f"\nBenchmark (CSI300) Return: {bench_ret*100:.2f}%")
         print(f"Excess Return: {(metrics['total_return']-bench_ret)*100:.2f}%")
 
-    nav_df.to_csv(os.path.join(config.CACHE_DIR, "backtest_nav.csv"),
-                  index=False)
-    print(f"\nNAV saved to {config.CACHE_DIR}/backtest_nav.csv")
+    nav_path = os.path.join(config.CACHE_DIR, "backtest_nav.csv")
+    nav_df.to_csv(nav_path, index=False)
+    print(f"\nNAV saved to {nav_path}")
+
+    bench_path = os.path.join(config.MARKET_DIR, "000300.SH.csv")
+    plot_backtest_nav(nav_path,
+                      bench_csv=bench_path if os.path.exists(bench_path) else None)
 
 
 if __name__ == "__main__":

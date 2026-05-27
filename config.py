@@ -15,7 +15,7 @@ BASIC_CSV = os.path.join(DATA_ROOT, "basic.csv")
 MARKET_DIR = os.path.join(DATA_ROOT, "market")
 INDEX_WEIGHT_DIR = os.path.join(DATA_ROOT, "index_weight")
 
-USE_CSI300 = False
+USE_CSI300 = True
 
 TRAIN_START = "20240101"
 TRAIN_END = "20250630"
@@ -31,9 +31,9 @@ HIDDEN_DIM = 128
 NUM_HEADS = 4
 DROPOUT = 0.1
 LR = 2e-4
-EPOCHS = 30
+EPOCHS = 100
 BATCH_SIZE = 512
-PATIENCE = 5
+PATIENCE = 50
 
 N_HOLD = 20
 K_SWAP = 3

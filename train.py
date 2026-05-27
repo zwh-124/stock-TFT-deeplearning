@@ -147,7 +147,19 @@ def main():
         if val_ic > best_ic:
             best_ic = val_ic
             patience_counter = 0
-            torch.save(model.state_dict(), model_path)
+            torch.save({
+                'state_dict': model.state_dict(),
+                'config': {
+                    'USE_CSI300': config.USE_CSI300,
+                    'HIDDEN_DIM': config.HIDDEN_DIM,
+                    'NUM_HEADS': config.NUM_HEADS,
+                    'SEQ_LEN': config.SEQ_LEN,
+                    'PRED_HORIZON': config.PRED_HORIZON,
+                    'DROPOUT': config.DROPOUT,
+                    'DYNAMIC_FEATURES': avail_features,
+                    'STATIC_FEATURES': list(STATIC_FEATURES),
+                },
+            }, model_path)
             print(f"  -> Saved best model (IC={best_ic:.4f})")
         else:
             patience_counter += 1

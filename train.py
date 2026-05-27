@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from model import CompetitionTFT
+from model import CompetitionTFT, DiffusionDenoiser
 from dataset import StockDataset
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
@@ -32,8 +32,23 @@ def compute_daily_ic(predictions, targets, dates):
     return ic_mean, ic_mean / ic_std
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def gated_feature_loss(pred, gate_weights, target):
+    """Gated multi-feature variance loss.
+
+    pred: (B, N_features) predicted next-step features
+    gate_weights: (B, N_features) learned per-feature importance (sum=1)
+    target: (B, N_features) actual next-step features
+    """
+    per_feature_var = (pred - target) ** 2
+    weighted_loss = (gate_weights * per_feature_var).sum(dim=-1)
+    return weighted_loss.mean()
+
+
+def train_one_epoch(model, loader, optimizer, device,
+                    denoiser=None, denoiser_optimizer=None):
     model.train()
+    if denoiser:
+        denoiser.train()
     total_loss = 0
     n = 0
     for x_dyn, x_stat, y in loader:
@@ -41,18 +56,29 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         x_stat = x_stat.to(device)
         y = y.to(device)
         optimizer.zero_grad()
-        pred = model(x_dyn, x_stat)
-        loss = criterion(pred, y)
-        loss.backward()
+        if denoiser_optimizer:
+            denoiser_optimizer.zero_grad()
+        pred, gate_weights = model(x_dyn, x_stat)
+        loss = gated_feature_loss(pred, gate_weights, y)
+        if denoiser is not None:
+            d_loss = denoiser.compute_loss(x_dyn)
+            combined = loss + config.LAMBDA_DENOISE * d_loss
+        else:
+            combined = loss
+        combined.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if denoiser:
+            torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
         optimizer.step()
+        if denoiser_optimizer:
+            denoiser_optimizer.step()
         total_loss += loss.item() * len(y)
         n += len(y)
     return total_loss / n
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, dataset):
+def evaluate(model, loader, device, dataset, close_idx):
     model.eval()
     total_loss = 0
     n = 0
@@ -62,12 +88,12 @@ def evaluate(model, loader, criterion, device, dataset):
         x_dyn = x_dyn.to(device)
         x_stat = x_stat.to(device)
         y = y.to(device)
-        pred = model(x_dyn, x_stat)
-        loss = criterion(pred, y)
+        pred, gate_weights = model(x_dyn, x_stat)
+        loss = gated_feature_loss(pred, gate_weights, y)
         total_loss += loss.item() * len(y)
         n += len(y)
-        all_preds.append(pred.cpu().numpy())
-        all_targets.append(y.cpu().numpy())
+        all_preds.append(pred[:, close_idx].cpu().numpy())
+        all_targets.append(y[:, close_idx].cpu().numpy())
         batch_dates = [dataset.samples[idx + i]['date']
                        for i in range(len(y))]
         all_dates.extend(batch_dates)
@@ -114,11 +140,27 @@ def main():
         dropout=config.DROPOUT,
     ).to(device)
 
+    denoiser = None
+    denoiser_optimizer = None
+    if config.USE_DIFFUSION_DENOISER:
+        denoiser = DiffusionDenoiser(
+            feature_dim=len(avail_features),
+            seq_len=config.SEQ_LEN,
+            hidden_dim=config.DIFFUSION_HIDDEN_DIM,
+            time_dim=config.DIFFUSION_TIME_DIM,
+            n_timesteps=config.DIFFUSION_T,
+            beta_start=config.DIFFUSION_BETA_START,
+            beta_end=config.DIFFUSION_BETA_END,
+        ).to(device)
+        denoiser_optimizer = torch.optim.Adam(
+            denoiser.parameters(), lr=config.LR)
+        model.encoder.denoiser = denoiser
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.EPOCHS)
-    criterion = nn.MSELoss()
 
+    close_idx = avail_features.index('close')
     best_ic = -np.inf
     patience_counter = 0
     os.makedirs(config.CACHE_DIR, exist_ok=True)
@@ -127,9 +169,10 @@ def main():
 
     for epoch in range(config.EPOCHS):
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, device)
+            model, train_loader, optimizer, device,
+            denoiser, denoiser_optimizer)
         val_loss, val_ic, val_icir = evaluate(
-            model, val_loader, criterion, device, val_ds)
+            model, val_loader, device, val_ds, close_idx)
         scheduler.step()
 
         history['train_loss'].append(train_loss)
@@ -149,6 +192,7 @@ def main():
             patience_counter = 0
             torch.save({
                 'state_dict': model.state_dict(),
+                'denoiser_state': denoiser.state_dict() if denoiser else None,
                 'config': {
                     'USE_CSI300': config.USE_CSI300,
                     'HIDDEN_DIM': config.HIDDEN_DIM,

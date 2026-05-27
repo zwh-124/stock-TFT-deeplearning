@@ -9,6 +9,27 @@ from tqdm import tqdm
 import config
 
 
+def rolling_normalize_window(dynamic_data, seq_len, end_idx):
+    """Extract a normalized window [end_idx-seq_len : end_idx] from dynamic_data.
+
+    Uses the rolling mean/std computed over the window itself (same logic as
+    _build_samples). This is the public helper for env.py to reuse.
+
+    Args:
+        dynamic_data: np.ndarray of shape (T, num_features), full history for one stock
+        seq_len: window length
+        end_idx: the index of the last row (exclusive) in the window
+
+    Returns:
+        np.ndarray of shape (seq_len, num_features), normalized
+    """
+    window = dynamic_data[end_idx - seq_len:end_idx]
+    mean = window.mean(axis=0)
+    std = window.std(axis=0, ddof=0) + 1e-8
+    normalized = (window - mean) / std
+    return np.nan_to_num(normalized, 0.0).astype(np.float32)
+
+
 def _cache_key(df, dynamic_features, static_features, seq_len, pred_horizon):
     """Generate a hash based on inputs to detect stale cache."""
     h = hashlib.md5()
@@ -101,13 +122,13 @@ class StockDataset(Dataset):
                 x_dynamic = (window - mean) / std
                 x_dynamic = np.nan_to_num(x_dynamic, 0.0).astype(np.float32)
 
-                y_return = np.float32(
-                    (future_closes[j] - current_closes[j]) / current_closes[j])
+                future_row = dynamic_data[i + pred_horizon - 1]
+                y_features = np.nan_to_num(future_row, 0.0).astype(np.float32)
 
                 self.samples.append({
                     'x_dynamic': x_dynamic,
                     'x_static': static_data,
-                    'y': y_return,
+                    'y': y_features,
                     'date': dates[i],
                     'code': code,
                 })
@@ -119,4 +140,4 @@ class StockDataset(Dataset):
         s = self.samples[idx]
         return (torch.from_numpy(s['x_dynamic']),
                 torch.from_numpy(s['x_static']),
-                torch.tensor(s['y']))
+                torch.from_numpy(s['y']))

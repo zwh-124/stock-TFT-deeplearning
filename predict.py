@@ -77,7 +77,22 @@ def main():
         num_heads=config.NUM_HEADS,
         dropout=config.DROPOUT,
     ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    ckpt = torch.load(model_path, map_location=device)
+    if isinstance(ckpt, dict) and 'config' in ckpt:
+        saved_cfg = ckpt['config']
+        for key, cur in {'USE_CSI300': config.USE_CSI300,
+                         'HIDDEN_DIM': config.HIDDEN_DIM,
+                         'SEQ_LEN': config.SEQ_LEN,
+                         'NUM_HEADS': config.NUM_HEADS,
+                         'PRED_HORIZON': config.PRED_HORIZON}.items():
+            saved = saved_cfg.get(key)
+            if saved is not None and saved != cur:
+                print(f"WARNING: config mismatch — {key}: "
+                      f"trained={saved}, current={cur}")
+        model.load_state_dict(ckpt['state_dict'])
+    else:
+        model.load_state_dict(ckpt)
 
     pred_df = predict_latest(model, ds, device)
     signals = get_signals(pred_df)

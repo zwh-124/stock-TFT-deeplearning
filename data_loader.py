@@ -16,9 +16,11 @@ def load_csi300_codes():
     files = sorted([f for f in os.listdir(iw_dir) if '000300' in f])
     if not files:
         return None
-    latest = files[-1]
-    df = pd.read_csv(os.path.join(iw_dir, latest))
-    return set(df['con_code'].tolist())
+    for f in reversed(files):
+        df = pd.read_csv(os.path.join(iw_dir, f))
+        if len(df) > 0:
+            return set(df['con_code'].tolist())
+    return None
 
 
 def load_st_codes():

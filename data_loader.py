@@ -1,4 +1,5 @@
 import os
+import hashlib
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -50,6 +51,10 @@ def load_daily_data(start_date=None, end_date=None, stock_pool=None):
         if stock_pool:
             df = df[df['ts_code'].isin(stock_pool)]
         dfs.append(df)
+    if not dfs:
+        raise FileNotFoundError(
+            f"No daily data found in {config.DAILY_DIR} "
+            f"for range [{start_date}, {end_date}]")
     return pd.concat(dfs, ignore_index=True)
 
 
@@ -68,6 +73,10 @@ def load_metric_data(start_date=None, end_date=None, stock_pool=None):
         if stock_pool:
             df = df[df['ts_code'].isin(stock_pool)]
         dfs.append(df)
+    if not dfs:
+        raise FileNotFoundError(
+            f"No metric data found in {config.METRIC_DIR} "
+            f"for range [{start_date}, {end_date}]")
     return pd.concat(dfs, ignore_index=True)
 
 
@@ -86,6 +95,10 @@ def load_moneyflow_data(start_date=None, end_date=None, stock_pool=None):
         if stock_pool:
             df = df[df['ts_code'].isin(stock_pool)]
         dfs.append(df)
+    if not dfs:
+        raise FileNotFoundError(
+            f"No moneyflow data found in {config.MONEYFLOW_DIR} "
+            f"for range [{start_date}, {end_date}]")
     return pd.concat(dfs, ignore_index=True)
 
 
@@ -98,10 +111,92 @@ def filter_stocks(df, bj_codes, st_codes_by_date):
     return df.reset_index(drop=True)
 
 
+def load_market_features():
+    """Load market index features for 3 indices.
+
+    Per index: pct_chg, realized_vol (5d), vol_ratio (vs ma5)
+    Cross-index: mkt_mean_ret_5d, large_small_spread, mkt_overnight_gap
+    """
+    indices = {
+        'idx001': '000001.SH.csv',
+        'idx300': '000300.SH.csv',
+        'idx399': '399006.SZ.csv',
+    }
+    per_index_dfs = {}
+    for prefix, filename in indices.items():
+        path = os.path.join(config.MARKET_DIR, filename)
+        if not os.path.exists(path):
+            continue
+        df = pd.read_csv(path)
+        df['trade_date'] = df['trade_date'].astype(str)
+        df = df.sort_values('trade_date').reset_index(drop=True)
+
+        df[f'{prefix}_pct_chg'] = df['pct_chg']
+        ret = df['pct_chg'] / 100.0
+        df[f'{prefix}_realized_vol'] = ret.rolling(5, min_periods=2).std()
+        vol_ma5 = df['vol'].rolling(5, min_periods=1).mean()
+        df[f'{prefix}_vol_ratio'] = df['vol'] / (vol_ma5 + 1e-8)
+
+        df[f'__{prefix}_ret'] = ret
+        df[f'__{prefix}_gap'] = (df['open'] - df['pre_close']) / (
+            df['pre_close'] + 1e-8)
+        df[f'__{prefix}_ret_5d'] = ret.rolling(5, min_periods=1).sum()
+
+        per_index_dfs[prefix] = df
+
+    if not per_index_dfs:
+        return None
+
+    base_prefix = list(per_index_dfs.keys())[0]
+    result = per_index_dfs[base_prefix][['trade_date']].copy()
+
+    for prefix, df in per_index_dfs.items():
+        cols = [f'{prefix}_pct_chg', f'{prefix}_realized_vol',
+                f'{prefix}_vol_ratio']
+        result = result.merge(df[['trade_date'] + cols], on='trade_date',
+                              how='outer')
+
+    all_rets = []
+    all_gaps = []
+    all_ret_5d = []
+    for prefix, df in per_index_dfs.items():
+        tmp = df[['trade_date', f'__{prefix}_ret', f'__{prefix}_gap',
+                  f'__{prefix}_ret_5d']]
+        result = result.merge(tmp, on='trade_date', how='left')
+        all_rets.append(f'__{prefix}_ret')
+        all_gaps.append(f'__{prefix}_gap')
+        all_ret_5d.append(f'__{prefix}_ret_5d')
+
+    result['mkt_mean_ret_5d'] = result[all_ret_5d].mean(axis=1)
+
+    if '__idx300_ret' in result.columns and '__idx399_ret' in result.columns:
+        result['large_small_spread'] = (
+            result['__idx300_ret'] - result['__idx399_ret'])
+    else:
+        result['large_small_spread'] = 0.0
+
+    result['mkt_overnight_gap'] = result[all_gaps].mean(axis=1)
+
+    drop_cols = [c for c in result.columns if c.startswith('__')]
+    result = result.drop(columns=drop_cols)
+    return result
+
+
+def _data_loader_version():
+    """Hash key source files to detect stale cache."""
+    h = hashlib.md5()
+    for fname in ['data_loader.py', 'feature_engine.py']:
+        path = os.path.join(os.path.dirname(__file__), fname)
+        if os.path.exists(path):
+            h.update(open(path, 'rb').read())
+    return h.hexdigest()[:8]
+
+
 def build_merged_dataset(start_date=None, end_date=None):
     date_tag = f"_{start_date}_{end_date}" if start_date and end_date else ""
     base_name = "merged_csi300" if config.USE_CSI300 else "merged_all"
-    cache_name = f"{base_name}{date_tag}.pkl"
+    version = _data_loader_version()
+    cache_name = f"{base_name}{date_tag}_{version}.pkl"
     cache_path = os.path.join(config.CACHE_DIR, cache_name)
     if os.path.exists(cache_path):
         print(f"Loading cached data from {cache_path}")
@@ -139,10 +234,16 @@ def build_merged_dataset(start_date=None, end_date=None):
     merged = daily.merge(metric, on=['ts_code', 'trade_date'], how='left')
     merged = merged.merge(moneyflow, on=['ts_code', 'trade_date'], how='left')
 
+    market_features = load_market_features()
+    if market_features is not None:
+        merged = merged.merge(market_features, on='trade_date', how='left')
+
     merged = filter_stocks(merged, bj_codes, st_codes_by_date)
 
-    industry_map = dict(zip(basic_df['ts_code'],
-                            basic_df['industry'].astype('category').cat.codes))
+    categories = sorted(basic_df['industry'].dropna().unique())
+    cat_map = {c: i for i, c in enumerate(categories)}
+    industry_map = {code: cat_map.get(ind, -1)
+                    for code, ind in zip(basic_df['ts_code'], basic_df['industry'])}
     merged['industry_code'] = merged['ts_code'].map(industry_map).fillna(-1)
 
     merged = merged.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)

@@ -63,7 +63,8 @@ def add_moneyflow_features(group):
     sell_main = group.get('sell_elg_amount', 0) + group.get('sell_lg_amount', 0)
     total_flow = buy_main + sell_main + 1e-8
     group['main_net_ratio'] = (buy_main - sell_main) / total_flow
-    group['net_mf_ma5'] = group['net_mf_amount'].rolling(5, min_periods=1).mean()
+    net_mf = group.get('net_mf_amount', pd.Series(0.0, index=group.index))
+    group['net_mf_ma5'] = net_mf.rolling(5, min_periods=1).mean()
     return group
 
 
@@ -83,6 +84,11 @@ DYNAMIC_FEATURES = [
     'atr_14', 'boll_width', 'vol_ma5_ratio',
     'turnover_rate', 'pe_ttm', 'pb', 'log_mv',
     'net_mf_amount', 'main_net_ratio', 'net_mf_ma5',
+    # 市场指数特征
+    'idx001_pct_chg', 'idx001_realized_vol', 'idx001_vol_ratio',
+    'idx300_pct_chg', 'idx300_realized_vol', 'idx300_vol_ratio',
+    'idx399_pct_chg', 'idx399_realized_vol', 'idx399_vol_ratio',
+    'mkt_mean_ret_5d', 'large_small_spread', 'mkt_overnight_gap',
 ]
 
 STATIC_FEATURES = ['industry_code']

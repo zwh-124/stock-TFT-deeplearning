@@ -31,16 +31,26 @@ class AShareTradingEnv:
         self.pre_close_prices = np.full((n_dates, self.n_stocks), np.nan)
         self.suspended = np.ones((n_dates, self.n_stocks), dtype=bool)
 
-        for _, row in panel_df.iterrows():
-            di = self.date_to_idx[row['trade_date']]
-            si = self.code_to_idx[row['ts_code']]
-            self.open_prices[di, si] = row['open']
-            self.close_prices[di, si] = row['close']
-            pre_c = row.get('pre_close', np.nan)
-            if pd.isna(pre_c) and di > 0:
-                pre_c = self.close_prices[di - 1, si]
-            self.pre_close_prices[di, si] = pre_c
-            self.suspended[di, si] = False
+        pdf = panel_df.copy()
+        pdf['_di'] = pdf['trade_date'].map(self.date_to_idx)
+        pdf['_si'] = pdf['ts_code'].map(self.code_to_idx)
+        valid = pdf.dropna(subset=['_di', '_si'])
+        di = valid['_di'].astype(int).values
+        si = valid['_si'].astype(int).values
+
+        self.open_prices[di, si] = valid['open'].values
+        self.close_prices[di, si] = valid['close'].values
+        self.suspended[di, si] = False
+
+        if 'pre_close' in valid.columns:
+            pre_vals = valid['pre_close'].values.astype(float)
+            has_pre = ~np.isnan(pre_vals)
+            self.pre_close_prices[di[has_pre], si[has_pre]] = pre_vals[has_pre]
+
+        for j in range(self.n_stocks):
+            for i in range(1, n_dates):
+                if np.isnan(self.pre_close_prices[i, j]):
+                    self.pre_close_prices[i, j] = self.close_prices[i - 1, j]
 
     # === PLACEHOLDER_ENV_METHODS ===
 
@@ -65,11 +75,24 @@ class AShareTradingEnv:
             "nav": nav,
         }
 
-    def _compute_nav(self):
-        prices = self.close_prices[self.current_idx]
+    def _compute_nav(self, prices=None):
+        if prices is None:
+            prices = self.close_prices[self.current_idx]
         stock_value = np.nansum(
             (self.holdings + self.locked).astype(np.float64) * prices)
         return self.cash + stock_value
+
+    def get_valuation_prices(self):
+        """Return the appropriate prices for current phase valuation.
+
+        open phase: use previous day's close (last known price)
+        close phase: use current day's close
+        """
+        if self.phase == "open":
+            if self.current_idx > 0:
+                return self.close_prices[self.current_idx - 1]
+            return self.open_prices[self.current_idx]
+        return self.close_prices[self.current_idx]
 
     def _limit_prices(self, date_idx):
         pre = self.pre_close_prices[date_idx]
@@ -81,16 +104,18 @@ class AShareTradingEnv:
         limit_up, _ = self._limit_prices(date_idx)
         prices = self.open_prices[date_idx] if self.phase == "open" \
             else self.close_prices[date_idx]
-        hit_limit_up = prices >= limit_up
-        mask = ~self.suspended[date_idx] & ~hit_limit_up
+        valid_price = ~np.isnan(prices)
+        hit_limit_up = np.nan_to_num(prices, nan=np.inf) >= limit_up
+        mask = ~self.suspended[date_idx] & ~hit_limit_up & valid_price
         return mask
 
     def _can_sell(self, date_idx):
         _, limit_down = self._limit_prices(date_idx)
         prices = self.open_prices[date_idx] if self.phase == "open" \
             else self.close_prices[date_idx]
-        hit_limit_down = prices <= limit_down
-        mask = ~self.suspended[date_idx] & ~hit_limit_down
+        valid_price = ~np.isnan(prices)
+        hit_limit_down = np.nan_to_num(prices, nan=-np.inf) <= limit_down
+        mask = ~self.suspended[date_idx] & ~hit_limit_down & valid_price
         return mask
 
     def step(self, target_weights):
@@ -161,15 +186,16 @@ class AShareTradingEnv:
         turnover = (np.abs(target_weights - self.prev_weights)).sum()
 
         if self.phase == "open":
+            nav_after = self._compute_nav()
             self.phase = "close"
         else:
+            nav_after = self._compute_nav()
             self.current_idx += 1
             self.phase = "open"
             self.holdings += self.locked
             self.locked[:] = 0
 
         done = self.current_idx >= len(self.dates)
-        nav_after = self._compute_nav() if not done else nav_before
 
         self.prev_weights = target_weights.copy()
         reward = np.log(nav_after / nav_before + 1e-10) \

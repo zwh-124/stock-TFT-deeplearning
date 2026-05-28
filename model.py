@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import config
 
 
 def sinusoidal_embedding(t, dim):
@@ -165,8 +166,14 @@ class TFTEncoder(nn.Module):
     def forward(self, dynamic_x, static_x):
         seq_len = dynamic_x.shape[1]
 
-        if self.denoiser is not None and not self.training:
-            dynamic_x = self.denoiser.denoise(dynamic_x)
+        if self.denoiser is not None:
+            with torch.no_grad():
+                denoised = self.denoiser.denoise(
+                    dynamic_x,
+                    t_start=config.DENOISE_T_START,
+                    n_steps=config.DENOISE_STEPS,
+                )
+            dynamic_x = denoised.detach()
 
         embedded_dynamic = self.dynamic_embedding(dynamic_x.unsqueeze(-1))
         selected_features = self.vsn(embedded_dynamic)

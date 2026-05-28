@@ -30,9 +30,13 @@ def rolling_normalize_window(dynamic_data, seq_len, end_idx):
     return np.nan_to_num(normalized, 0.0).astype(np.float32)
 
 
+_DATASET_VERSION = "v2_normalized_target"
+
+
 def _cache_key(df, dynamic_features, static_features, seq_len, pred_horizon):
     """Generate a hash based on inputs to detect stale cache."""
     h = hashlib.md5()
+    h.update(_DATASET_VERSION.encode())
     h.update(str(dynamic_features).encode())
     h.update(str(static_features).encode())
     h.update(f"{seq_len}_{pred_horizon}".encode())
@@ -123,7 +127,8 @@ class StockDataset(Dataset):
                 x_dynamic = np.nan_to_num(x_dynamic, 0.0).astype(np.float32)
 
                 future_row = dynamic_data[i + pred_horizon - 1]
-                y_features = np.nan_to_num(future_row, 0.0).astype(np.float32)
+                y_features = ((future_row - mean) / std)
+                y_features = np.nan_to_num(y_features, 0.0).astype(np.float32)
 
                 self.samples.append({
                     'x_dynamic': x_dynamic,

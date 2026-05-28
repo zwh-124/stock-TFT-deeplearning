@@ -38,8 +38,9 @@ class GRPOTrainer:
 
     def _maybe_unfreeze_encoder(self):
         if self.encoder_frozen and self.step_count >= self.encoder_unfreeze_step:
-            for p in self.encoder.parameters():
-                p.requires_grad = True
+            for name, p in self.encoder.named_parameters():
+                if not name.startswith('denoiser.'):
+                    p.requires_grad = True
             self.encoder_frozen = False
 
     def _maybe_refresh_ref(self):
@@ -49,18 +50,6 @@ class GRPOTrainer:
     # === PLACEHOLDER_GRPO_COLLECT ===
 
     def collect_and_update(self, dynamic_x, static_x, port_state, mask, head):
-        """One GRPO step: sample G actions, simulate, compute loss, update.
-
-        Args:
-            dynamic_x: [N_alive, T, V] tensor
-            static_x: [N_alive, S] tensor
-            port_state: [N_alive, 4] tensor (cash_frac, hold_frac, locked_frac, prev_w)
-            mask: [N_alive] bool tensor (tradeable stocks)
-            head: "open" or "close"
-
-        Returns:
-            dict with loss, mean_reward, kl
-        """
         self._maybe_unfreeze_encoder()
         self._maybe_refresh_ref()
 
@@ -73,7 +62,6 @@ class GRPOTrainer:
         rewards = []
         actions_all = []
 
-        base_state = self.env._get_state()
         n_bins = config.N_BINS
         bins = torch.tensor(config.BINS, device=self.device, dtype=torch.float32)
 
@@ -83,7 +71,8 @@ class GRPOTrainer:
             log_probs_all.append(dist.log_prob(action))
 
             weights = bins[action].detach().cpu().numpy()
-            top_k_idx = np.argsort(weights)[-config.N_HOLD:]
+            noise = np.random.uniform(0, 1e-6, size=weights.shape)
+            top_k_idx = np.argsort(weights + noise)[-config.N_HOLD:]
             target_w = np.zeros(self.env.n_stocks)
             for idx in top_k_idx:
                 if idx < len(weights):
@@ -97,18 +86,22 @@ class GRPOTrainer:
             rewards.append(reward)
 
         rewards = torch.tensor(rewards, device=self.device, dtype=torch.float32)
-        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        reward_std = rewards.std()
+        if reward_std < 1e-4:
+            advantages = torch.zeros_like(rewards)
+        else:
+            advantages = (rewards - rewards.mean()) / (reward_std + 1e-8)
 
         log_probs = torch.stack(log_probs_all)
         if log_probs.dim() > 1:
-            log_probs = log_probs.sum(dim=-1)
+            log_probs = log_probs.mean(dim=-1)
 
         with torch.no_grad():
             ref_dist = self.ref_policy(enc.detach(), port_state, mask, head)
 
         kl = torch.distributions.kl_divergence(dist, ref_dist)
         if kl.dim() > 1:
-            kl = kl.sum(dim=-1)
+            kl = kl.mean(dim=-1)
         kl = kl.mean()
 
         policy_loss = -(advantages.detach() * log_probs).mean()
@@ -120,8 +113,12 @@ class GRPOTrainer:
 
         loss.backward()
 
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
         self.optimizer_policy.step()
         if not self.encoder_frozen:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.encoder.parameters() if p.requires_grad],
+                1.0)
             self.optimizer_encoder.step()
 
         self.step_count += 1

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from model import CompetitionTFT
+from model import CompetitionTFT, DiffusionDenoiser
 from dataset import StockDataset
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
@@ -12,15 +12,15 @@ import config
 
 
 @torch.no_grad()
-def generate_predictions(model, dataset, device):
+def generate_predictions(model, dataset, device, close_idx):
     model.eval()
     loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, shuffle=False)
     all_preds = []
     for x_dyn, x_stat, _ in loader:
         x_dyn = x_dyn.to(device)
         x_stat = x_stat.to(device)
-        pred = model(x_dyn, x_stat)
-        all_preds.append(pred.cpu().numpy())
+        pred, _ = model(x_dyn, x_stat)
+        all_preds.append(pred[:, close_idx].cpu().numpy())
     all_preds = np.concatenate(all_preds)
     records = []
     for i, s in enumerate(dataset.samples):
@@ -28,7 +28,7 @@ def generate_predictions(model, dataset, device):
             'date': s['date'],
             'code': s['code'],
             'pred_score': all_preds[i],
-            'y_true': s['y'],
+            'y_true': s['y'][close_idx],
         })
     return pd.DataFrame(records)
 
@@ -83,16 +83,18 @@ def compute_metrics(nav_df):
     n_days = len(returns)
     total_return = nav_df['nav'].iloc[-1] / nav_df['nav'].iloc[0] - 1
     annual_return = (1 + total_return) ** (252 / max(n_days, 1)) - 1
-    sharpe = np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+    sharpe = np.mean(returns) / (np.std(returns, ddof=1) + 1e-8) * np.sqrt(252)
     cummax = nav_df['nav'].cummax()
     drawdown = (nav_df['nav'] - cummax) / cummax
     max_drawdown = drawdown.min()
+    dir_acc = (returns[1:] > 0).sum() / max(len(returns) - 1, 1)
     return {
         'annual_return': annual_return,
         'sharpe_ratio': sharpe,
         'max_drawdown': max_drawdown,
         'total_return': total_return,
         'n_days': n_days,
+        'direction_accuracy': dir_acc,
     }
 
 
@@ -145,12 +147,27 @@ def main():
             if saved is not None and saved != cur:
                 print(f"WARNING: config mismatch — {key}: "
                       f"trained={saved}, current={cur}")
-        model.load_state_dict(ckpt['state_dict'])
+        sd = ckpt['state_dict']
     else:
-        model.load_state_dict(ckpt)
+        sd = ckpt
 
+    if any(k.startswith('encoder.denoiser.') for k in sd.keys()):
+        denoiser = DiffusionDenoiser(
+            feature_dim=len(avail_features),
+            seq_len=config.SEQ_LEN,
+            hidden_dim=config.DIFFUSION_HIDDEN_DIM,
+            time_dim=config.DIFFUSION_TIME_DIM,
+            n_timesteps=config.DIFFUSION_T,
+            beta_start=config.DIFFUSION_BETA_START,
+            beta_end=config.DIFFUSION_BETA_END,
+        ).to(device)
+        model.encoder.denoiser = denoiser
+
+    model.load_state_dict(sd)
+
+    close_idx = avail_features.index('close')
     print("Generating predictions...")
-    pred_df = generate_predictions(model, val_ds, device)
+    pred_df = generate_predictions(model, val_ds, device, close_idx)
 
     daily_df = df[['ts_code', 'trade_date', 'close']].copy()
     daily_df.rename(columns={'trade_date': 'trade_date'}, inplace=True)
@@ -164,6 +181,7 @@ def main():
     print(f"Sharpe Ratio:  {metrics['sharpe_ratio']:.3f}")
     print(f"Max Drawdown:  {metrics['max_drawdown']*100:.2f}%")
     print(f"Total Return:  {metrics['total_return']*100:.2f}%")
+    print(f"Dir Accuracy:  {metrics['direction_accuracy']*100:.2f}%")
     print(f"Trading Days:  {metrics['n_days']}")
 
     bench = load_benchmark('000300.SH', nav_df['date'].tolist())

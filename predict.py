@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from model import CompetitionTFT
+from model import CompetitionTFT, DiffusionDenoiser
 from dataset import StockDataset
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
@@ -11,15 +11,15 @@ import config
 
 
 @torch.no_grad()
-def predict_latest(model, dataset, device):
+def predict_latest(model, dataset, device, close_idx):
     model.eval()
     loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, shuffle=False)
     all_preds = []
     for x_dyn, x_stat, _ in loader:
         x_dyn = x_dyn.to(device)
         x_stat = x_stat.to(device)
-        pred = model(x_dyn, x_stat)
-        all_preds.append(pred.cpu().numpy())
+        pred, _ = model(x_dyn, x_stat)
+        all_preds.append(pred[:, close_idx].cpu().numpy())
     all_preds = np.concatenate(all_preds)
     records = []
     for i, s in enumerate(dataset.samples):
@@ -90,11 +90,26 @@ def main():
             if saved is not None and saved != cur:
                 print(f"WARNING: config mismatch — {key}: "
                       f"trained={saved}, current={cur}")
-        model.load_state_dict(ckpt['state_dict'])
+        sd = ckpt['state_dict']
     else:
-        model.load_state_dict(ckpt)
+        sd = ckpt
 
-    pred_df = predict_latest(model, ds, device)
+    if any(k.startswith('encoder.denoiser.') for k in sd.keys()):
+        denoiser = DiffusionDenoiser(
+            feature_dim=len(avail_features),
+            seq_len=config.SEQ_LEN,
+            hidden_dim=config.DIFFUSION_HIDDEN_DIM,
+            time_dim=config.DIFFUSION_TIME_DIM,
+            n_timesteps=config.DIFFUSION_T,
+            beta_start=config.DIFFUSION_BETA_START,
+            beta_end=config.DIFFUSION_BETA_END,
+        ).to(device)
+        model.encoder.denoiser = denoiser
+
+    model.load_state_dict(sd)
+
+    close_idx = avail_features.index('close')
+    pred_df = predict_latest(model, ds, device, close_idx)
     signals = get_signals(pred_df)
 
     print(f"\n=== Prediction for {signals['date']} ===")

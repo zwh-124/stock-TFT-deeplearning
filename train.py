@@ -1,7 +1,7 @@
 import os
+import random
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from model import CompetitionTFT, DiffusionDenoiser
 from dataset import StockDataset
@@ -9,6 +9,21 @@ from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from plot import plot_training_curves
 import config
+
+
+SEED = 42
+
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def worker_init_fn(worker_id):
+    np.random.seed(SEED + worker_id)
 
 
 def compute_daily_ic(predictions, targets, dates):
@@ -32,6 +47,22 @@ def compute_daily_ic(predictions, targets, dates):
     return ic_mean, ic_mean / ic_std
 
 
+def compute_direction_accuracy(predictions, targets, dates):
+    unique_dates = np.unique(dates)
+    daily_accs = []
+    for d in unique_dates:
+        mask = dates == d
+        if mask.sum() < 10:
+            continue
+        pred_d = predictions[mask]
+        tgt_d = targets[mask]
+        correct = ((pred_d > 0) == (tgt_d > 0)).mean()
+        daily_accs.append(correct)
+    if not daily_accs:
+        return 0.0
+    return np.mean(daily_accs)
+
+
 def gated_feature_loss(pred, gate_weights, target):
     """Gated multi-feature variance loss.
 
@@ -40,7 +71,7 @@ def gated_feature_loss(pred, gate_weights, target):
     target: (B, N_features) actual next-step features
     """
     per_feature_var = (pred - target) ** 2
-    weighted_loss = (gate_weights * per_feature_var).sum(dim=-1)
+    weighted_loss = (gate_weights.detach() * per_feature_var).sum(dim=-1)
     return weighted_loss.mean()
 
 
@@ -67,8 +98,6 @@ def train_one_epoch(model, loader, optimizer, device,
             combined = loss
         combined.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if denoiser:
-            torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
         optimizer.step()
         if denoiser_optimizer:
             denoiser_optimizer.step()
@@ -79,6 +108,7 @@ def train_one_epoch(model, loader, optimizer, device,
 
 @torch.no_grad()
 def evaluate(model, loader, device, dataset, close_idx):
+    """Evaluate model. Requires loader with shuffle=False for date tracking."""
     model.eval()
     total_loss = 0
     n = 0
@@ -102,10 +132,12 @@ def evaluate(model, loader, device, dataset, close_idx):
     all_targets = np.concatenate(all_targets)
     all_dates = np.array(all_dates)
     ic, icir = compute_daily_ic(all_preds, all_targets, all_dates)
-    return total_loss / n, ic, icir
+    dir_acc = compute_direction_accuracy(all_preds, all_targets, all_dates)
+    return total_loss / n, ic, icir, dir_acc
 
 
 def main():
+    set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -127,9 +159,11 @@ def main():
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE,
-                              shuffle=False, num_workers=4, pin_memory=True)
+                              shuffle=True, num_workers=4, pin_memory=True,
+                              worker_init_fn=worker_init_fn)
     val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE,
-                            shuffle=False, num_workers=4, pin_memory=True)
+                            shuffle=False, num_workers=4, pin_memory=True,
+                            worker_init_fn=worker_init_fn)
 
     model = CompetitionTFT(
         dynamic_input_dim=len(avail_features),
@@ -156,7 +190,9 @@ def main():
             denoiser.parameters(), lr=config.LR)
         model.encoder.denoiser = denoiser
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
+    encoder_params = [p for n, p in model.named_parameters()
+                      if not n.startswith("encoder.denoiser.")]
+    optimizer = torch.optim.Adam(encoder_params, lr=config.LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.EPOCHS)
 
@@ -165,13 +201,14 @@ def main():
     patience_counter = 0
     os.makedirs(config.CACHE_DIR, exist_ok=True)
     model_path = os.path.join(config.CACHE_DIR, "best_model.pt")
-    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'icir': []}
+    history = {'train_loss': [], 'val_loss': [], 'ic': [], 'icir': [],
+                'dir_acc': []}
 
     for epoch in range(config.EPOCHS):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device,
             denoiser, denoiser_optimizer)
-        val_loss, val_ic, val_icir = evaluate(
+        val_loss, val_ic, val_icir, val_dir_acc = evaluate(
             model, val_loader, device, val_ds, close_idx)
         scheduler.step()
 
@@ -179,12 +216,14 @@ def main():
         history['val_loss'].append(val_loss)
         history['ic'].append(val_ic)
         history['icir'].append(val_icir)
+        history['dir_acc'].append(val_dir_acc)
 
         lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1:02d} | "
               f"Train Loss: {train_loss:.6f} | "
               f"Val Loss: {val_loss:.6f} | "
               f"IC: {val_ic:.4f} | ICIR: {val_icir:.4f} | "
+              f"DirAcc: {val_dir_acc:.4f} | "
               f"LR: {lr:.2e}")
 
         if val_ic > best_ic:

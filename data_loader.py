@@ -240,6 +240,17 @@ def build_merged_dataset(start_date=None, end_date=None):
 
     merged = filter_stocks(merged, bj_codes, st_codes_by_date)
 
+    # 过滤新股上市初期数据（前 IPO_SKIP_DAYS 个交易日）
+    list_date_map = dict(zip(basic_df['ts_code'],
+                             basic_df['list_date'].astype(str)))
+    merged = merged.sort_values(['ts_code', 'trade_date'])
+    merged['_days_since_ipo'] = merged.groupby('ts_code').cumcount()
+    before_len = len(merged)
+    merged = merged[merged['_days_since_ipo'] >= config.IPO_SKIP_DAYS]
+    merged = merged.drop(columns=['_days_since_ipo'])
+    print(f"IPO filter: removed {before_len - len(merged)} rows "
+          f"(first {config.IPO_SKIP_DAYS} trading days per stock)")
+
     categories = sorted(basic_df['industry'].dropna().unique())
     cat_map = {c: i for i, c in enumerate(categories)}
     industry_map = {code: cat_map.get(ind, -1)

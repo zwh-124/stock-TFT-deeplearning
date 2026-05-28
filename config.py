@@ -16,6 +16,7 @@ MARKET_DIR = os.path.join(DATA_ROOT, "market")
 INDEX_WEIGHT_DIR = os.path.join(DATA_ROOT, "index_weight")
 
 USE_CSI300 = True
+IPO_SKIP_DAYS = 40
 
 TRAIN_START = "20220701"
 TRAIN_END = "20240701"

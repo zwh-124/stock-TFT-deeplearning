@@ -30,7 +30,7 @@ def rolling_normalize_window(dynamic_data, seq_len, end_idx):
     return np.nan_to_num(normalized, 0.0).astype(np.float32)
 
 
-_DATASET_VERSION = "v2_normalized_target"
+_DATASET_VERSION = "v3_delta_target"
 
 
 def _cache_key(df, dynamic_features, static_features, seq_len, pred_horizon):
@@ -131,8 +131,9 @@ class StockDataset(Dataset):
                 x_dynamic = (window - mean) / std
                 x_dynamic = np.nan_to_num(x_dynamic, 0.0).astype(np.float32)
 
+                last_row = dynamic_data[i - 1]
                 future_row = dynamic_data[i + pred_horizon - 1]
-                y_features = ((future_row - mean) / std)
+                y_features = ((future_row - last_row) / std)
                 y_features = np.nan_to_num(y_features, 0.0).astype(np.float32)
 
                 self.samples.append({

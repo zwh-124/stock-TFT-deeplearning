@@ -8,7 +8,7 @@ from dataset import StockDataset
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
-from plot import plot_training_curves
+from plot import plot_training_curves, plot_ic_distribution, plot_feature_importance
 import config
 
 
@@ -42,10 +42,10 @@ def compute_daily_ic(predictions, targets, dates):
         if not np.isnan(ic):
             daily_ics.append(ic)
     if len(daily_ics) == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, []
     ic_mean = np.mean(daily_ics)
     ic_std = np.std(daily_ics) + 1e-8
-    return ic_mean, ic_mean / ic_std
+    return ic_mean, ic_mean / ic_std, daily_ics
 
 
 def compute_direction_accuracy(predictions, targets, dates):
@@ -143,9 +143,9 @@ def evaluate(model, loader, device, dataset, close_idx):
     all_preds = np.concatenate(all_preds)
     all_targets = np.concatenate(all_targets)
     all_dates = np.array(all_dates)
-    ic, icir = compute_daily_ic(all_preds, all_targets, all_dates)
+    ic, icir, daily_ics = compute_daily_ic(all_preds, all_targets, all_dates)
     dir_acc = compute_direction_accuracy(all_preds, all_targets, all_dates)
-    return total_loss / n, ic, icir, dir_acc
+    return total_loss / n, ic, icir, dir_acc, daily_ics
 
 
 def main():
@@ -216,7 +216,7 @@ def main():
     os.makedirs(config.CACHE_DIR, exist_ok=True)
     model_path = os.path.join(config.CACHE_DIR, "best_model.pt")
     history = {'train_loss': [], 'val_loss': [], 'ic': [], 'icir': [],
-                'dir_acc': []}
+                'dir_acc': [], 'daily_ics': []}
 
     use_amp = device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
@@ -225,7 +225,7 @@ def main():
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device,
             denoiser, denoiser_optimizer, scaler)
-        val_loss, val_ic, val_icir, val_dir_acc = evaluate(
+        val_loss, val_ic, val_icir, val_dir_acc, val_daily_ics = evaluate(
             model, val_loader, device, val_ds, close_idx)
         scheduler.step()
 
@@ -234,6 +234,7 @@ def main():
         history['ic'].append(val_ic)
         history['icir'].append(val_icir)
         history['dir_acc'].append(val_dir_acc)
+        history['daily_ics'] = val_daily_ics
 
         lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1:02d} | "
@@ -270,6 +271,21 @@ def main():
                 break
 
     plot_training_curves(history)
+
+    if 'daily_ics' in history and history['daily_ics']:
+        plot_ic_distribution(history['daily_ics'])
+
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+    with torch.no_grad():
+        sample_x_dyn, sample_x_stat, _ = next(iter(val_loader))
+        sample_x_dyn = sample_x_dyn.to(device)
+        sample_x_stat = sample_x_stat.to(device)
+        _, gate_w = model(sample_x_dyn, sample_x_stat)
+        avg_gate = gate_w.cpu().numpy().mean(axis=0)
+    plot_feature_importance(avg_gate, avail_features)
+
     print(f"\nTraining done. Best IC: {best_ic:.4f}")
     print(f"Model saved to: {model_path}")
 

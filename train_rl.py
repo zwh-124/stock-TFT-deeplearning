@@ -11,6 +11,7 @@ from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
 from env import AShareTradingEnv
 from grpo_trainer import GRPOTrainer
 from rl_utils import get_obs_for_date, build_port_state, ObsCache
+from plot import plot_rl_reward_curve
 
 
 SEED = 42
@@ -215,6 +216,7 @@ def main():
 
     print(f"Training done. Best avg reward (100-step): {best_reward:.6f}")
     print(f"Model saved to {os.path.join(config.CACHE_DIR, 'best_rl_policy.pt')}")
+    plot_rl_reward_curve(reward_history)
 
 
 if __name__ == "__main__":

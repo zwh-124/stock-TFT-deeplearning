@@ -9,7 +9,7 @@ from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
 from env import AShareTradingEnv
-from plot import plot_backtest_nav
+from plot import plot_backtest_nav, plot_drawdown
 from rl_utils import get_obs_for_date, build_port_state, ObsCache
 
 
@@ -234,7 +234,9 @@ def main():
 
     bench_path = os.path.join(config.MARKET_DIR, "000300.SH.csv")
     plot_backtest_nav(nav_path,
-                      bench_csv=bench_path if os.path.exists(bench_path) else None)
+                      bench_csv=bench_path if os.path.exists(bench_path) else None,
+                      filename='backtest_rl_nav.png')
+    plot_drawdown(nav_path, filename='drawdown_rl.png')
 
 
 if __name__ == "__main__":

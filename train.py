@@ -65,18 +65,19 @@ def compute_direction_accuracy(predictions, targets, dates):
 
 
 def gated_feature_loss(pred, gate_weights, target):
-    """Gated multi-feature loss with per-feature target variance normalization."""
+    """Gated multi-feature loss with variance normalization."""
     per_feature_mse = (pred - target) ** 2  # (B, F)
     feat_scale = (target ** 2).mean(dim=0).clamp(min=1e-6)  # (F,)
     norm_mse = per_feature_mse / feat_scale
 
     weighted_loss = (gate_weights * norm_mse).sum(dim=-1)
     entropy = -(gate_weights * torch.log(gate_weights + 1e-8)).sum(dim=-1)
-    return weighted_loss.mean() - 0.05 * entropy.mean()
+    return weighted_loss.mean() - config.LAMBDA_ENTROPY * entropy.mean()
 
 
 def train_one_epoch(model, loader, optimizer, device,
-                    denoiser=None, denoiser_optimizer=None, scaler=None):
+                    denoiser=None, denoiser_optimizer=None,
+                    scaler=None):
     model.train()
     if denoiser:
         denoiser.train()
@@ -184,6 +185,7 @@ def main():
         dropout=config.DROPOUT,
         static_categorical=STATIC_CATEGORICAL,
         static_n_continuous=len(STATIC_CONTINUOUS),
+        avail_features=avail_features,
     ).to(device)
 
     denoiser = None

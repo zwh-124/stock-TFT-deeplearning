@@ -102,6 +102,8 @@ STATIC_CATEGORICAL = {
 }
 STATIC_CONTINUOUS = ['stock_age']
 
+TRIVIAL_FEATURES = ['open', 'high', 'low', 'vwap', 'pct_chg']
+
 
 def build_features(df):
     print("Computing features per stock...")

@@ -276,7 +276,8 @@ class TFTEncoder(nn.Module):
 class CompetitionTFT(nn.Module):
     def __init__(self, dynamic_input_dim, static_input_dim, hidden_dim=64,
                  seq_len=60, num_heads=4, dropout=0.1,
-                 static_categorical=None, static_n_continuous=0):
+                 static_categorical=None, static_n_continuous=0,
+                 avail_features=None):
         super().__init__()
         self.dynamic_input_dim = dynamic_input_dim
         self.encoder = TFTEncoder(dynamic_input_dim, static_input_dim,
@@ -288,13 +289,26 @@ class CompetitionTFT(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, dynamic_input_dim),
-            nn.Softmax(dim=-1),
         )
+        cap_mask = torch.ones(dynamic_input_dim)
+        if avail_features is not None:
+            from feature_engine import TRIVIAL_FEATURES
+            for i, f in enumerate(avail_features):
+                if f in TRIVIAL_FEATURES:
+                    cap_mask[i] = config.GATE_TRIVIAL_CAP
+        self.register_buffer('_cap_mask', cap_mask, persistent=False)
 
     def forward(self, dynamic_x, static_x):
         features = self.encoder(dynamic_x, static_x)
         pred = self.fc_out(features)
-        gate_weights = self.feature_gate(features)
+        gate_logits = self.feature_gate(features)
+        trivial_mask = (self._cap_mask < 1.0)
+        n_trivial = trivial_mask.sum().item()
+        trivial_budget = n_trivial * config.GATE_TRIVIAL_CAP
+        masked_logits = gate_logits.masked_fill(trivial_mask.unsqueeze(0), float('-inf'))
+        non_trivial_weights = F.softmax(masked_logits / config.GATE_TEMPERATURE, dim=-1)
+        gate_weights = non_trivial_weights * (1.0 - trivial_budget)
+        gate_weights[:, trivial_mask] = config.GATE_TRIVIAL_CAP
         return pred, gate_weights
 
 

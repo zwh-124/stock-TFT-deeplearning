@@ -136,6 +136,7 @@ def main():
         dropout=config.DROPOUT,
         static_categorical=STATIC_CATEGORICAL,
         static_n_continuous=len(STATIC_CONTINUOUS),
+        avail_features=avail_features,
     ).to(device)
 
     ckpt = torch.load(model_path, map_location=device)

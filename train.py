@@ -7,7 +7,8 @@ from model import CompetitionTFT, DiffusionDenoiser
 from dataset import StockDataset
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
-from plot import plot_training_curves
+from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
+from plot import plot_training_curves, plot_ic_distribution, plot_feature_importance
 import config
 
 
@@ -41,10 +42,10 @@ def compute_daily_ic(predictions, targets, dates):
         if not np.isnan(ic):
             daily_ics.append(ic)
     if len(daily_ics) == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, []
     ic_mean = np.mean(daily_ics)
     ic_std = np.std(daily_ics) + 1e-8
-    return ic_mean, ic_mean / ic_std
+    return ic_mean, ic_mean / ic_std, daily_ics
 
 
 def compute_direction_accuracy(predictions, targets, dates):
@@ -64,19 +65,18 @@ def compute_direction_accuracy(predictions, targets, dates):
 
 
 def gated_feature_loss(pred, gate_weights, target):
-    """Gated multi-feature variance loss.
+    """Gated multi-feature loss with per-feature target variance normalization."""
+    per_feature_mse = (pred - target) ** 2  # (B, F)
+    feat_scale = (target ** 2).mean(dim=0).clamp(min=1e-6)  # (F,)
+    norm_mse = per_feature_mse / feat_scale
 
-    pred: (B, N_features) predicted next-step features
-    gate_weights: (B, N_features) learned per-feature importance (sum=1)
-    target: (B, N_features) actual next-step features
-    """
-    per_feature_var = (pred - target) ** 2
-    weighted_loss = (gate_weights.detach() * per_feature_var).sum(dim=-1)
-    return weighted_loss.mean()
+    weighted_loss = (gate_weights * norm_mse).sum(dim=-1)
+    entropy = -(gate_weights * torch.log(gate_weights + 1e-8)).sum(dim=-1)
+    return weighted_loss.mean() - 0.05 * entropy.mean()
 
 
 def train_one_epoch(model, loader, optimizer, device,
-                    denoiser=None, denoiser_optimizer=None):
+                    denoiser=None, denoiser_optimizer=None, scaler=None):
     model.train()
     if denoiser:
         denoiser.train()
@@ -89,18 +89,28 @@ def train_one_epoch(model, loader, optimizer, device,
         optimizer.zero_grad()
         if denoiser_optimizer:
             denoiser_optimizer.zero_grad()
-        pred, gate_weights = model(x_dyn, x_stat)
-        loss = gated_feature_loss(pred, gate_weights, y)
-        if denoiser is not None:
-            d_loss = denoiser.compute_loss(x_dyn)
-            combined = loss + config.LAMBDA_DENOISE * d_loss
+        with torch.amp.autocast('cuda', enabled=scaler is not None):
+            pred, gate_weights = model(x_dyn, x_stat)
+            loss = gated_feature_loss(pred, gate_weights, y)
+            if denoiser is not None:
+                d_loss = denoiser.compute_loss(x_dyn)
+                combined = loss + config.LAMBDA_DENOISE * d_loss
+            else:
+                combined = loss
+        if scaler is not None:
+            scaler.scale(combined).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            if denoiser_optimizer:
+                scaler.step(denoiser_optimizer)
+            scaler.update()
         else:
-            combined = loss
-        combined.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        if denoiser_optimizer:
-            denoiser_optimizer.step()
+            combined.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            if denoiser_optimizer:
+                denoiser_optimizer.step()
         total_loss += loss.item() * len(y)
         n += len(y)
     return total_loss / n
@@ -131,9 +141,9 @@ def evaluate(model, loader, device, dataset, close_idx):
     all_preds = np.concatenate(all_preds)
     all_targets = np.concatenate(all_targets)
     all_dates = np.array(all_dates)
-    ic, icir = compute_daily_ic(all_preds, all_targets, all_dates)
+    ic, icir, daily_ics = compute_daily_ic(all_preds, all_targets, all_dates)
     dir_acc = compute_direction_accuracy(all_preds, all_targets, all_dates)
-    return total_loss / n, ic, icir, dir_acc
+    return total_loss / n, ic, icir, dir_acc, daily_ics
 
 
 def main():
@@ -172,6 +182,8 @@ def main():
         seq_len=config.SEQ_LEN,
         num_heads=config.NUM_HEADS,
         dropout=config.DROPOUT,
+        static_categorical=STATIC_CATEGORICAL,
+        static_n_continuous=len(STATIC_CONTINUOUS),
     ).to(device)
 
     denoiser = None
@@ -197,18 +209,21 @@ def main():
         optimizer, T_max=config.EPOCHS)
 
     close_idx = avail_features.index('close')
-    best_ic = -np.inf
+    best_val_loss = np.inf
     patience_counter = 0
     os.makedirs(config.CACHE_DIR, exist_ok=True)
     model_path = os.path.join(config.CACHE_DIR, "best_model.pt")
     history = {'train_loss': [], 'val_loss': [], 'ic': [], 'icir': [],
-                'dir_acc': []}
+                'dir_acc': [], 'daily_ics': []}
+
+    use_amp = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     for epoch in range(config.EPOCHS):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device,
-            denoiser, denoiser_optimizer)
-        val_loss, val_ic, val_icir, val_dir_acc = evaluate(
+            denoiser, denoiser_optimizer, scaler)
+        val_loss, val_ic, val_icir, val_dir_acc, val_daily_ics = evaluate(
             model, val_loader, device, val_ds, close_idx)
         scheduler.step()
 
@@ -217,6 +232,7 @@ def main():
         history['ic'].append(val_ic)
         history['icir'].append(val_icir)
         history['dir_acc'].append(val_dir_acc)
+        history['daily_ics'] = val_daily_ics
 
         lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1:02d} | "
@@ -226,8 +242,8 @@ def main():
               f"DirAcc: {val_dir_acc:.4f} | "
               f"LR: {lr:.2e}")
 
-        if val_ic > best_ic:
-            best_ic = val_ic
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience_counter = 0
             torch.save({
                 'state_dict': model.state_dict(),
@@ -241,9 +257,11 @@ def main():
                     'DROPOUT': config.DROPOUT,
                     'DYNAMIC_FEATURES': avail_features,
                     'STATIC_FEATURES': list(STATIC_FEATURES),
+                    'STATIC_CATEGORICAL': STATIC_CATEGORICAL,
+                    'STATIC_CONTINUOUS': STATIC_CONTINUOUS,
                 },
             }, model_path)
-            print(f"  -> Saved best model (IC={best_ic:.4f})")
+            print(f"  -> Saved best model (val_loss={best_val_loss:.6f})")
         else:
             patience_counter += 1
             if patience_counter >= config.PATIENCE:
@@ -251,7 +269,22 @@ def main():
                 break
 
     plot_training_curves(history)
-    print(f"\nTraining done. Best IC: {best_ic:.4f}")
+
+    if 'daily_ics' in history and history['daily_ics']:
+        plot_ic_distribution(history['daily_ics'])
+
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+    with torch.no_grad():
+        sample_x_dyn, sample_x_stat, _ = next(iter(val_loader))
+        sample_x_dyn = sample_x_dyn.to(device)
+        sample_x_stat = sample_x_stat.to(device)
+        _, gate_w = model(sample_x_dyn, sample_x_stat)
+        avg_gate = gate_w.cpu().numpy().mean(axis=0)
+    plot_feature_importance(avg_gate, avail_features)
+
+    print(f"\nTraining done. Best val_loss: {best_val_loss:.6f}")
     print(f"Model saved to: {model_path}")
 
 

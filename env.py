@@ -47,20 +47,25 @@ class AShareTradingEnv:
             has_pre = ~np.isnan(pre_vals)
             self.pre_close_prices[di[has_pre], si[has_pre]] = pre_vals[has_pre]
 
-        for j in range(self.n_stocks):
-            for i in range(1, n_dates):
-                if np.isnan(self.pre_close_prices[i, j]):
-                    self.pre_close_prices[i, j] = self.close_prices[i - 1, j]
+        mask = np.isnan(self.pre_close_prices)
+        mask[0, :] = False
+        shifted_close = np.empty_like(self.pre_close_prices)
+        shifted_close[0, :] = np.nan
+        shifted_close[1:, :] = self.close_prices[:-1, :]
+        self.pre_close_prices = np.where(mask, shifted_close, self.pre_close_prices)
 
     # === PLACEHOLDER_ENV_METHODS ===
 
-    def reset(self, start_date_idx=0):
+    def reset(self, start_date_idx=0, episode_len=None):
         self.cash = self.init_capital
         self.holdings = np.zeros(self.n_stocks, dtype=np.int64)
         self.locked = np.zeros(self.n_stocks, dtype=np.int64)
         self.prev_weights = np.zeros(self.n_stocks, dtype=np.float64)
         self.current_idx = start_date_idx
         self.phase = "open"
+        self.episode_start_idx = start_date_idx
+        self.episode_len = episode_len if episode_len is not None else config.EPISODE_LEN
+        self.episode_day = 0
         return self._get_state()
 
     def _get_state(self):
@@ -73,6 +78,8 @@ class AShareTradingEnv:
             "locked": self.locked.copy(),
             "prev_weights": self.prev_weights.copy(),
             "nav": nav,
+            "episode_day": self.episode_day,
+            "is_last_day": self.episode_day >= self.episode_len - 1,
         }
 
     def _compute_nav(self, prices=None):
@@ -118,17 +125,22 @@ class AShareTradingEnv:
         mask = ~self.suspended[date_idx] & ~hit_limit_down & valid_price
         return mask
 
-    def step(self, target_weights):
+    def step(self, target_weights, force_liquidate=False):
         """Execute one decision step.
 
         Args:
-            target_weights: np.ndarray [n_stocks], target portfolio weight per stock.
+            target_weights: np.ndarray [n_stocks], target portfolio weight.
+            force_liquidate: if True, sell all holdings ignoring target_weights.
 
         Returns:
             (next_state, reward, done, info)
         """
         date_idx = self.current_idx
         nav_before = self._compute_nav()
+
+        is_last_day = self.episode_day >= self.episode_len - 1
+        if force_liquidate or (is_last_day and self.phase == "close"):
+            target_weights = np.zeros(self.n_stocks)
 
         if self.phase == "open":
             prices = self.open_prices[date_idx]
@@ -183,6 +195,12 @@ class AShareTradingEnv:
             self.cash -= total
             self.locked[i] += shares
 
+        cash_penalty = 0.0
+        if self.cash > config.MAX_CASH:
+            cash_penalty = config.LAMBDA_CASH_PENALTY * (
+                (self.cash - config.MAX_CASH) / self.init_capital)
+            self._force_reduce_cash(prices, can_buy)
+
         turnover = (np.abs(target_weights - self.prev_weights)).sum()
 
         if self.phase == "open":
@@ -194,15 +212,51 @@ class AShareTradingEnv:
             self.phase = "open"
             self.holdings += self.locked
             self.locked[:] = 0
+            self.episode_day += 1
 
-        done = self.current_idx >= len(self.dates)
+        episode_done = self.episode_day >= self.episode_len
+        data_done = self.current_idx >= len(self.dates)
+        done = episode_done or data_done
 
         self.prev_weights = target_weights.copy()
         reward = np.log(nav_after / nav_before + 1e-10) \
-            - config.LAMBDA_TURNOVER * turnover
+            - config.LAMBDA_TURNOVER * turnover - cash_penalty
 
-        info = {"nav": nav_after, "turnover": turnover}
+        info = {"nav": nav_after, "turnover": turnover,
+                "cash_penalty": cash_penalty}
         return self._get_state() if not done else None, reward, done, info
+
+    def _force_reduce_cash(self, prices, can_buy):
+        """Buy stocks to bring cash below MAX_CASH."""
+        buyable = np.where(
+            can_buy & ~np.isnan(prices) & (prices > 0))[0]
+        if len(buyable) == 0:
+            return
+        current_val = (self.holdings + self.locked).astype(float) * \
+            np.nan_to_num(prices, 0)
+        weights = current_val[buyable]
+        w_sum = weights.sum()
+        if w_sum < 1e-8:
+            weights = np.ones(len(buyable)) / len(buyable)
+        else:
+            weights = weights / w_sum
+
+        excess = self.cash - config.MAX_CASH
+        for j, idx in enumerate(buyable):
+            alloc = excess * weights[j]
+            shares = int(alloc / (prices[idx] * (1 + self.commission))
+                         / self.lot) * self.lot
+            if shares <= 0:
+                continue
+            cost = shares * prices[idx]
+            comm = max(cost * self.commission, self.min_commission)
+            total = cost + comm
+            if total > self.cash:
+                continue
+            self.cash -= total
+            self.locked[idx] += shares
+            if self.cash <= config.MAX_CASH:
+                break
 
     def clone(self):
         """Create a lightweight copy for GRPO group sampling."""

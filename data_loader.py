@@ -240,11 +240,49 @@ def build_merged_dataset(start_date=None, end_date=None):
 
     merged = filter_stocks(merged, bj_codes, st_codes_by_date)
 
+    # 过滤新股上市初期数据（前 IPO_SKIP_DAYS 个交易日）
+    list_date_map = dict(zip(basic_df['ts_code'],
+                             basic_df['list_date'].astype(str)))
+    merged = merged.sort_values(['ts_code', 'trade_date'])
+    merged['_days_since_ipo'] = merged.groupby('ts_code').cumcount()
+    before_len = len(merged)
+    merged = merged[merged['_days_since_ipo'] >= config.IPO_SKIP_DAYS]
+    merged = merged.drop(columns=['_days_since_ipo'])
+    print(f"IPO filter: removed {before_len - len(merged)} rows "
+          f"(first {config.IPO_SKIP_DAYS} trading days per stock)")
+
     categories = sorted(basic_df['industry'].dropna().unique())
-    cat_map = {c: i for i, c in enumerate(categories)}
-    industry_map = {code: cat_map.get(ind, -1)
+    cat_map = {c: i + 1 for i, c in enumerate(categories)}
+    industry_map = {code: cat_map.get(ind, 0)
                     for code, ind in zip(basic_df['ts_code'], basic_df['industry'])}
-    merged['industry_code'] = merged['ts_code'].map(industry_map).fillna(-1)
+    merged['industry_code'] = merged['ts_code'].map(industry_map).fillna(0).astype(int)
+
+    area_cats = sorted(basic_df['area'].dropna().unique())
+    area_map = {a: i + 1 for i, a in enumerate(area_cats)}
+    area_code_map = {code: area_map.get(area, 0)
+                     for code, area in zip(basic_df['ts_code'], basic_df['area'])}
+    merged['area_code'] = merged['ts_code'].map(area_code_map).fillna(0).astype(int)
+
+    market_cats = ['主板', '创业板', '科创板', '北交所']
+    market_map = {m: i + 1 for i, m in enumerate(market_cats)}
+    market_code_map = {code: market_map.get(mkt, 0)
+                       for code, mkt in zip(basic_df['ts_code'], basic_df['market'])}
+    merged['market_code'] = merged['ts_code'].map(market_code_map).fillna(0).astype(int)
+
+    ent_cats = sorted(basic_df['act_ent_type'].dropna().unique())
+    ent_map = {e: i + 1 for i, e in enumerate(ent_cats)}
+    ent_code_map = {code: ent_map.get(ent, 0)
+                    for code, ent in zip(basic_df['ts_code'], basic_df['act_ent_type'])}
+    merged['ent_type_code'] = merged['ts_code'].map(ent_code_map).fillna(0).astype(int)
+
+    list_date_map = dict(zip(basic_df['ts_code'], basic_df['list_date'].astype(str)))
+    merged['_list_date'] = merged['ts_code'].map(list_date_map)
+    merged['stock_age'] = (
+        pd.to_datetime(merged['trade_date'], format='%Y%m%d') -
+        pd.to_datetime(merged['_list_date'], format='%Y%m%d')
+    ).dt.days / 365.25
+    merged['stock_age'] = merged['stock_age'].clip(0, 40).astype(np.float32)
+    merged = merged.drop(columns=['_list_date'])
 
     merged = merged.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
 

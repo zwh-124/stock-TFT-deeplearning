@@ -91,7 +91,16 @@ DYNAMIC_FEATURES = [
     'mkt_mean_ret_5d', 'large_small_spread', 'mkt_overnight_gap',
 ]
 
-STATIC_FEATURES = ['industry_code']
+STATIC_FEATURES = ['industry_code', 'area_code', 'market_code',
+                   'ent_type_code', 'stock_age']
+
+STATIC_CATEGORICAL = {
+    'industry_code': 120,
+    'area_code': 40,
+    'market_code': 5,
+    'ent_type_code': 12,
+}
+STATIC_CONTINUOUS = ['stock_age']
 
 
 def build_features(df):

@@ -6,10 +6,12 @@ import torch
 import config
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
+from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
 from env import AShareTradingEnv
 from grpo_trainer import GRPOTrainer
 from rl_utils import get_obs_for_date, build_port_state, ObsCache
+from plot import plot_rl_reward_curve
 
 
 SEED = 42
@@ -145,11 +147,13 @@ def main():
                          hidden_dim=config.HIDDEN_DIM,
                          seq_len=config.SEQ_LEN,
                          num_heads=config.NUM_HEADS,
-                         dropout=config.DROPOUT).to(device)
+                         dropout=config.DROPOUT,
+                         static_categorical=STATIC_CATEGORICAL,
+                         static_n_continuous=len(STATIC_CONTINUOUS)).to(device)
     load_pretrained_encoder(encoder, device, dynamic_dim, avail_features)
 
     policy = PortfolioPolicy(config.HIDDEN_DIM, n_bins=config.N_BINS,
-                             n_extra_state=4, dropout=config.DROPOUT).to(device)
+                             n_extra_state=6, dropout=config.DROPOUT).to(device)
 
     trainer = GRPOTrainer(encoder, policy, env, device=device)
 
@@ -157,32 +161,32 @@ def main():
                    if config.TRAIN_START <= d <= config.TRAIN_END]
     seq_len = config.SEQ_LEN
 
+    valid_starts = [d for d in train_dates[seq_len:]
+                    if d + config.EPISODE_LEN - 1 < len(env.dates)]
+
     grouped = df.sort_values('trade_date').groupby('ts_code')
     obs_cache = ObsCache(grouped, avail_features, env, seq_len)
 
-    print(f"RL training for {config.RL_STEPS} steps...")
+    print(f"RL training for {config.RL_STEPS} episodes "
+          f"({len(valid_starts)} valid starts)...")
     best_reward = -np.inf
     reward_history = []
 
     for step in range(config.RL_STEPS):
-        date_idx = random.choice(train_dates[seq_len:])
-        phase = random.choice(["open", "close"])
+        start_idx = random.choice(valid_starts)
 
-        env.reset(start_date_idx=date_idx)
-        randomize_portfolio_state(env, date_idx)
-        env.phase = phase
+        env.reset(start_date_idx=start_idx, episode_len=config.EPISODE_LEN)
+        randomize_portfolio_state(env, start_idx)
 
-        dyn_t, stat_t, mask_t = obs_cache.get_obs(date_idx, env, device)
-        port_state = build_port_state(env, device)
-
-        metrics = trainer.collect_and_update(
-            dyn_t, stat_t, port_state, mask_t, phase)
+        metrics = trainer.collect_trajectory_and_update(
+            env, obs_cache, start_idx, device)
 
         reward_history.append(metrics['mean_reward'])
-        if step % 50 == 0:
-            print(f"Step {step}/{config.RL_STEPS} | "
+        if step % 10 == 0:
+            print(f"Episode {step}/{config.RL_STEPS} | "
                   f"loss={metrics['loss']:.4f} | "
-                  f"reward={metrics['mean_reward']:.6f} | "
+                  f"mean_reward={metrics['mean_reward']:.6f} | "
+                  f"best_reward={metrics['best_reward']:.6f} | "
                   f"kl={metrics['kl']:.4f}")
 
         window = reward_history[-100:]
@@ -203,6 +207,8 @@ def main():
                     'N_BINS': config.N_BINS,
                     'BINS': config.BINS,
                     'N_HOLD': config.N_HOLD,
+                    'EPISODE_LEN': config.EPISODE_LEN,
+                    'MAX_CASH': config.MAX_CASH,
                     'USE_DIFFUSION_DENOISER': config.USE_DIFFUSION_DENOISER,
                     'DYNAMIC_FEATURES': avail_features,
                 },
@@ -210,6 +216,7 @@ def main():
 
     print(f"Training done. Best avg reward (100-step): {best_reward:.6f}")
     print(f"Model saved to {os.path.join(config.CACHE_DIR, 'best_rl_policy.pt')}")
+    plot_rl_reward_curve(reward_history)
 
 
 if __name__ == "__main__":

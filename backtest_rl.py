@@ -6,9 +6,10 @@ import torch
 import config
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
+from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
 from env import AShareTradingEnv
-from plot import plot_backtest_nav
+from plot import plot_backtest_nav, plot_drawdown
 from rl_utils import get_obs_for_date, build_port_state, ObsCache
 
 
@@ -55,7 +56,9 @@ def load_rl_model(device, avail_features):
                          hidden_dim=config.HIDDEN_DIM,
                          seq_len=config.SEQ_LEN,
                          num_heads=config.NUM_HEADS,
-                         dropout=config.DROPOUT).to(device)
+                         dropout=config.DROPOUT,
+                         static_categorical=STATIC_CATEGORICAL,
+                         static_n_continuous=len(STATIC_CONTINUOUS)).to(device)
     policy = PortfolioPolicy(config.HIDDEN_DIM, n_bins=config.N_BINS,
                              n_extra_state=4, dropout=config.DROPOUT).to(device)
 
@@ -114,46 +117,58 @@ def run_backtest(encoder, policy, env, obs_cache, device):
         print("No valid test dates found.")
         return None
 
-    env.reset(start_date_idx=test_dates[0])
     nav_history = []
+    ep_start = 0
+    step = 0
 
-    for step, date_idx in enumerate(test_dates):
-        date = env.dates[date_idx]
-        env.current_idx = date_idx
+    while ep_start < len(test_dates):
+        start_idx = test_dates[ep_start]
+        ep_end = min(ep_start + config.EPISODE_LEN, len(test_dates))
+        env.reset(start_date_idx=start_idx, episode_len=config.EPISODE_LEN)
 
-        done = False
-        for phase in ["open", "close"]:
-            env.phase = phase
-            dyn_t, stat_t, mask_t = obs_cache.get_obs(date_idx, env, device)
-            port_state = build_port_state(env, device)
+        for day_offset in range(ep_end - ep_start):
+            date_idx = env.current_idx
+            if date_idx >= len(env.dates):
+                break
+            date = env.dates[date_idx]
+            done = False
 
-            enc = encoder(dyn_t, stat_t)
-            dist = policy(enc, port_state, mask_t, phase)
-            action = dist.probs.argmax(dim=-1)
+            for phase in ["open", "close"]:
+                dyn_t, stat_t, mask_t = obs_cache.get_obs(
+                    date_idx, env, device)
+                port_state = build_port_state(env, device)
 
-            weights = bins[action].cpu().numpy()
-            top_k_idx = np.argsort(weights)[-config.N_HOLD:]
-            target_w = np.zeros(env.n_stocks)
-            for idx in top_k_idx:
-                target_w[idx] = weights[idx]
-            w_sum = target_w.sum()
-            if w_sum > 0:
-                target_w = target_w / w_sum
+                enc = encoder(dyn_t, stat_t)
+                dist = policy(enc, port_state, mask_t, env.phase)
+                action = dist.probs.argmax(dim=-1)
 
-            state, reward, done, info = env.step(target_w)
+                weights = bins[action].cpu().numpy()
+                top_k_idx = np.argsort(weights)[-config.N_HOLD:]
+                target_w = np.zeros(env.n_stocks)
+                for idx in top_k_idx:
+                    target_w[idx] = weights[idx]
+                w_sum = target_w.sum()
+                if w_sum > 0:
+                    target_w = target_w / w_sum
+
+                state, reward, done, info = env.step(target_w)
+                if done:
+                    break
+
+            nav = info['nav']
+            prev_nav = nav_history[-1]['nav'] if nav_history else \
+                config.INIT_CAPITAL
+            day_ret = (nav / prev_nav) - 1 if prev_nav > 0 else 0.0
+            nav_history.append({'date': date, 'nav': nav, 'return': day_ret})
+
+            if step % 20 == 0:
+                print(f"  [{step}/{len(test_dates)}] {date} NAV={nav:,.0f}")
+            step += 1
+
             if done:
                 break
 
-        nav = info['nav']
-        prev_nav = nav_history[-1]['nav'] if nav_history else config.INIT_CAPITAL
-        day_ret = (nav / prev_nav) - 1 if prev_nav > 0 else 0.0
-        nav_history.append({'date': date, 'nav': nav, 'return': day_ret})
-
-        if step % 20 == 0:
-            print(f"  [{step}/{len(test_dates)}] {date} NAV={nav:,.0f}")
-
-        if done:
-            break
+        ep_start = ep_end
 
     return pd.DataFrame(nav_history)
 
@@ -219,7 +234,9 @@ def main():
 
     bench_path = os.path.join(config.MARKET_DIR, "000300.SH.csv")
     plot_backtest_nav(nav_path,
-                      bench_csv=bench_path if os.path.exists(bench_path) else None)
+                      bench_csv=bench_path if os.path.exists(bench_path) else None,
+                      filename='backtest_rl_nav.png')
+    plot_drawdown(nav_path, filename='drawdown_rl.png')
 
 
 if __name__ == "__main__":

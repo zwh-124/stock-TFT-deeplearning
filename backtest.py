@@ -7,6 +7,7 @@ from model import CompetitionTFT, DiffusionDenoiser
 from dataset import StockDataset
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
+from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from plot import plot_backtest_nav
 import config
 
@@ -133,6 +134,8 @@ def main():
         seq_len=config.SEQ_LEN,
         num_heads=config.NUM_HEADS,
         dropout=config.DROPOUT,
+        static_categorical=STATIC_CATEGORICAL,
+        static_n_continuous=len(STATIC_CONTINUOUS),
     ).to(device)
 
     ckpt = torch.load(model_path, map_location=device)

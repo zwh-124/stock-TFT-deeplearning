@@ -92,6 +92,43 @@ class DiffusionDenoiser(nn.Module):
         return x_t.reshape(B, self.seq_len, self.feature_dim)
 
 
+class StaticEmbedding(nn.Module):
+    """Embed categorical static features + project continuous ones to hidden_dim."""
+
+    def __init__(self, categorical_cardinalities, n_continuous,
+                 embed_dim=16, hidden_dim=128):
+        super().__init__()
+        self.n_categorical = len(categorical_cardinalities)
+        self.n_continuous = n_continuous
+        self.embed_dim = embed_dim
+
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(card, embed_dim)
+            for card in categorical_cardinalities.values()
+        ])
+
+        total_input = self.n_categorical * embed_dim + n_continuous
+        self.proj = nn.Sequential(
+            nn.Linear(total_input, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, static_x):
+        cat_embeds = []
+        for i, emb in enumerate(self.embeddings):
+            cat_embeds.append(emb(static_x[:, i].long()))
+        cat_concat = torch.cat(cat_embeds, dim=-1)
+
+        if self.n_continuous > 0:
+            cont = static_x[:, self.n_categorical:]
+            combined = torch.cat([cat_concat, cont], dim=-1)
+        else:
+            combined = cat_concat
+
+        return self.proj(combined)
+
+
 class GatedResidualNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim=None, dropout=0.1):
         super().__init__()
@@ -115,38 +152,73 @@ class GatedResidualNetwork(nn.Module):
         return self.layer_norm(x)
 
 
+class BatchedVariableGRN(nn.Module):
+    """Batched GRN that processes all variables in parallel via einsum."""
+
+    def __init__(self, num_vars, hidden_dim, dropout=0.1):
+        super().__init__()
+        self.num_vars = num_vars
+        self.hidden_dim = hidden_dim
+        self.fc1_weight = nn.Parameter(torch.empty(num_vars, hidden_dim, hidden_dim))
+        self.fc1_bias = nn.Parameter(torch.zeros(num_vars, hidden_dim))
+        self.fc2_weight = nn.Parameter(torch.empty(num_vars, hidden_dim, hidden_dim))
+        self.fc2_bias = nn.Parameter(torch.zeros(num_vars, hidden_dim))
+        self.gate_weight = nn.Parameter(torch.empty(num_vars, hidden_dim, hidden_dim))
+        self.gate_bias = nn.Parameter(torch.zeros(num_vars, hidden_dim))
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self):
+        for w in [self.fc1_weight, self.fc2_weight, self.gate_weight]:
+            for i in range(self.num_vars):
+                nn.init.xavier_uniform_(w.data[i])
+
+    def forward(self, x):
+        residual = x
+        x = F.elu(x)
+        x = torch.einsum('bsvh,vhd->bsvd', x, self.fc1_weight) + self.fc1_bias
+        x = self.dropout(F.elu(x))
+        x = torch.einsum('bsvh,vhd->bsvd', x, self.fc2_weight) + self.fc2_bias
+        gate = torch.sigmoid(
+            torch.einsum('bsvh,vhd->bsvd', x, self.gate_weight) + self.gate_bias)
+        x = gate * x + (1 - gate) * residual
+        return self.layer_norm(x)
+
+
 class VariableSelectionNetwork(nn.Module):
     def __init__(self, num_vars, hidden_dim, dropout=0.1):
         super().__init__()
         self.joint_grn = GatedResidualNetwork(
             num_vars * hidden_dim, hidden_dim,
             output_dim=num_vars, dropout=dropout)
-        self.variable_grns = nn.ModuleList([
-            GatedResidualNetwork(hidden_dim, hidden_dim, dropout=dropout)
-            for _ in range(num_vars)
-        ])
+        self.batched_grn = BatchedVariableGRN(num_vars, hidden_dim, dropout)
 
     def forward(self, x):
         batch, seq_len, num_vars, hidden_dim = x.shape
         flat_x = x.reshape(batch, seq_len, -1)
         weights = self.joint_grn(flat_x)
         weights = F.softmax(weights, dim=-1).unsqueeze(-1)
-        processed = torch.stack(
-            [grn(x[..., i, :]) for i, grn in enumerate(self.variable_grns)],
-            dim=-2)
+        processed = self.batched_grn(x)
         return torch.sum(processed * weights, dim=-2)
 
 
 class TFTEncoder(nn.Module):
     def __init__(self, dynamic_input_dim, static_input_dim, hidden_dim=64,
-                 seq_len=60, num_heads=4, dropout=0.1, denoiser=None):
+                 seq_len=60, num_heads=4, dropout=0.1, denoiser=None,
+                 static_categorical=None, static_n_continuous=0):
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
         self.denoiser = denoiser
 
         self.dynamic_embedding = nn.Linear(1, hidden_dim)
-        self.static_embedding = nn.Linear(static_input_dim, hidden_dim)
+        if static_categorical is not None:
+            self.static_embedding = StaticEmbedding(
+                static_categorical, static_n_continuous,
+                embed_dim=config.STATIC_EMBED_DIM, hidden_dim=hidden_dim)
+        else:
+            self.static_embedding = nn.Linear(static_input_dim, hidden_dim)
         self.pos_embedding = nn.Embedding(seq_len, hidden_dim)
 
         self.static_encoder = GatedResidualNetwork(hidden_dim, hidden_dim)
@@ -168,9 +240,14 @@ class TFTEncoder(nn.Module):
 
         if self.denoiser is not None:
             with torch.no_grad():
+                t_start = config.DENOISE_T_START
+                sqrt_ac = self.denoiser.sqrt_alpha_cumprod[t_start]
+                sqrt_omac = self.denoiser.sqrt_one_minus_alpha_cumprod[t_start]
+                noise = torch.randn_like(dynamic_x)
+                x_noisy = sqrt_ac * dynamic_x + sqrt_omac * noise
                 denoised = self.denoiser.denoise(
-                    dynamic_x,
-                    t_start=config.DENOISE_T_START,
+                    x_noisy,
+                    t_start=t_start,
                     n_steps=config.DENOISE_STEPS,
                 )
             dynamic_x = denoised.detach()
@@ -198,11 +275,14 @@ class TFTEncoder(nn.Module):
 
 class CompetitionTFT(nn.Module):
     def __init__(self, dynamic_input_dim, static_input_dim, hidden_dim=64,
-                 seq_len=60, num_heads=4, dropout=0.1):
+                 seq_len=60, num_heads=4, dropout=0.1,
+                 static_categorical=None, static_n_continuous=0):
         super().__init__()
         self.dynamic_input_dim = dynamic_input_dim
         self.encoder = TFTEncoder(dynamic_input_dim, static_input_dim,
-                                  hidden_dim, seq_len, num_heads, dropout)
+                                  hidden_dim, seq_len, num_heads, dropout,
+                                  static_categorical=static_categorical,
+                                  static_n_continuous=static_n_continuous)
         self.fc_out = nn.Linear(hidden_dim, dynamic_input_dim)
         self.feature_gate = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -219,7 +299,7 @@ class CompetitionTFT(nn.Module):
 
 
 class PortfolioPolicy(nn.Module):
-    def __init__(self, hidden_dim, n_bins=6, n_extra_state=4, dropout=0.1):
+    def __init__(self, hidden_dim, n_bins=6, n_extra_state=6, dropout=0.1):
         super().__init__()
         input_dim = hidden_dim + n_extra_state
         self.head_open = nn.Sequential(

@@ -80,6 +80,10 @@ class StockDataset(Dataset):
 
     def _build_samples(self, df, dynamic_features, static_features,
                        seq_len, pred_horizon):
+        from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
+        cat_features = list(STATIC_CATEGORICAL.keys())
+        cont_features = STATIC_CONTINUOUS
+
         close_idx = dynamic_features.index('close')
         groups = list(df.groupby('ts_code'))
 
@@ -89,7 +93,8 @@ class StockDataset(Dataset):
             if n < seq_len + pred_horizon:
                 continue
 
-            static_data = group[static_features].iloc[0].values.astype(np.float32)
+            static_cat = group[cat_features].iloc[0].values.astype(np.float32)
+            cont_data = group[cont_features].values.astype(np.float32)
             dynamic_data = group[dynamic_features].values.astype(np.float32)
             dates = group['trade_date'].values
 
@@ -132,7 +137,7 @@ class StockDataset(Dataset):
 
                 self.samples.append({
                     'x_dynamic': x_dynamic,
-                    'x_static': static_data,
+                    'x_static': np.concatenate([static_cat, cont_data[i]]),
                     'y': y_features,
                     'date': dates[i],
                     'code': code,

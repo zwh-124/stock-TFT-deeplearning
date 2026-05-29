@@ -7,6 +7,7 @@ import torch
 import config
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
+from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
 from env import AShareTradingEnv
 from rl_utils import get_obs_for_date, build_port_state, ObsCache
@@ -16,6 +17,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=str, required=True,
                         help="Target date YYYYMMDD")
+    parser.add_argument("--episode-day", type=int, default=0,
+                        help="Current day within the 10-day episode (0-9)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,9 +40,11 @@ def main():
                          hidden_dim=config.HIDDEN_DIM,
                          seq_len=config.SEQ_LEN,
                          num_heads=config.NUM_HEADS,
-                         dropout=config.DROPOUT).to(device)
+                         dropout=config.DROPOUT,
+                         static_categorical=STATIC_CATEGORICAL,
+                         static_n_continuous=len(STATIC_CONTINUOUS)).to(device)
     policy = PortfolioPolicy(config.HIDDEN_DIM, n_bins=config.N_BINS,
-                             n_extra_state=4, dropout=config.DROPOUT).to(device)
+                             n_extra_state=6, dropout=config.DROPOUT).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
@@ -107,10 +112,28 @@ def main():
     orders = []
     bins = torch.tensor(config.BINS, device=device, dtype=torch.float32)
 
-    env.reset(start_date_idx=date_idx)
+    env.reset(start_date_idx=date_idx, episode_len=config.EPISODE_LEN)
+    env.episode_day = args.episode_day
+
+    is_last_day = args.episode_day >= config.EPISODE_LEN - 1
 
     for phase in ["open", "close"]:
         env.phase = phase
+
+        if is_last_day and phase == "close":
+            for i in range(env.n_stocks):
+                if env.holdings[i] > 0:
+                    prices_now = env.close_prices[date_idx]
+                    if not np.isnan(prices_now[i]) and prices_now[i] > 0:
+                        orders.append({
+                            "date": target_date, "phase": phase,
+                            "code": env.codes[i], "side": "sell",
+                            "shares": int(env.holdings[i]),
+                            "target_price": prices_now[i],
+                            "limit_up": env._limit_prices(date_idx)[0][i],
+                            "limit_down": env._limit_prices(date_idx)[1][i],
+                        })
+            break
 
         dyn_t, stat_t, mask_t = obs_cache.get_obs(date_idx, env, device)
         port_state = build_port_state(env, device)
@@ -168,11 +191,9 @@ def main():
 
         env.step(target_w)
 
-        # 80%仓位保障：追加买入信号（不通过env执行，仅作为交易建议）
         nav_after = env._compute_nav()
-        position_ratio = 1.0 - env.cash / (nav_after + 1e-8)
-        if position_ratio < 0.8:
-            remaining = env.cash
+        if env.cash > config.MAX_CASH:
+            remaining = env.cash - config.MAX_CASH
             ranked = sorted(
                 [(target_w[i], i) for i in top_k_idx
                  if not np.isnan(prices[i]) and prices[i] > 0],

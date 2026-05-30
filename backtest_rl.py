@@ -62,7 +62,7 @@ def load_rl_model(device, avail_features):
                          static_categorical=STATIC_CATEGORICAL,
                          static_n_continuous=len(STATIC_CONTINUOUS)).to(device)
     policy = PortfolioPolicy(config.HIDDEN_DIM, n_bins=config.N_BINS,
-                             n_extra_state=6, dropout=config.DROPOUT).to(device)
+                             n_extra_state=config.N_EXTRA_STATE, dropout=config.DROPOUT).to(device)
 
     if any(k.startswith('denoiser.') for k in ckpt["encoder"].keys()):
         denoiser = DiffusionDenoiser(

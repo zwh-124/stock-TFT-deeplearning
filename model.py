@@ -235,7 +235,7 @@ class TFTEncoder(nn.Module):
         self.post_attn_grn = GatedResidualNetwork(
             hidden_dim, hidden_dim, dropout=dropout)
 
-    def forward(self, dynamic_x, static_x):
+    def forward(self, dynamic_x, static_x, denoise_noise=None):
         seq_len = dynamic_x.shape[1]
 
         if self.denoiser is not None:
@@ -243,7 +243,12 @@ class TFTEncoder(nn.Module):
                 t_start = config.DENOISE_T_START
                 sqrt_ac = self.denoiser.sqrt_alpha_cumprod[t_start]
                 sqrt_omac = self.denoiser.sqrt_one_minus_alpha_cumprod[t_start]
-                noise = torch.randn_like(dynamic_x)
+                if denoise_noise is not None:
+                    noise = denoise_noise
+                elif not self.training:
+                    noise = torch.zeros_like(dynamic_x)
+                else:
+                    noise = torch.randn_like(dynamic_x)
                 x_noisy = sqrt_ac * dynamic_x + sqrt_omac * noise
                 denoised = self.denoiser.denoise(
                     x_noisy,
@@ -273,44 +278,6 @@ class TFTEncoder(nn.Module):
         return final_features[:, -1, :]
 
 
-class CompetitionTFT(nn.Module):
-    def __init__(self, dynamic_input_dim, static_input_dim, hidden_dim=64,
-                 seq_len=60, num_heads=4, dropout=0.1,
-                 static_categorical=None, static_n_continuous=0,
-                 avail_features=None):
-        super().__init__()
-        self.dynamic_input_dim = dynamic_input_dim
-        self.encoder = TFTEncoder(dynamic_input_dim, static_input_dim,
-                                  hidden_dim, seq_len, num_heads, dropout,
-                                  static_categorical=static_categorical,
-                                  static_n_continuous=static_n_continuous)
-        self.fc_out = nn.Linear(hidden_dim, dynamic_input_dim)
-        self.feature_gate = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, dynamic_input_dim),
-        )
-        cap_mask = torch.ones(dynamic_input_dim)
-        if avail_features is not None:
-            from feature_engine import TRIVIAL_FEATURES
-            for i, f in enumerate(avail_features):
-                if f in TRIVIAL_FEATURES:
-                    cap_mask[i] = config.GATE_TRIVIAL_CAP
-        self.register_buffer('_cap_mask', cap_mask, persistent=False)
-
-    def forward(self, dynamic_x, static_x):
-        features = self.encoder(dynamic_x, static_x)
-        pred = self.fc_out(features)
-        gate_logits = self.feature_gate(features)
-        trivial_mask = (self._cap_mask < 1.0)
-        n_trivial = trivial_mask.sum().item()
-        trivial_budget = n_trivial * config.GATE_TRIVIAL_CAP
-        masked_logits = gate_logits.masked_fill(trivial_mask.unsqueeze(0), float('-inf'))
-        non_trivial_weights = F.softmax(masked_logits / config.GATE_TEMPERATURE, dim=-1)
-        gate_weights = non_trivial_weights * (1.0 - trivial_budget)
-        gate_weights[:, trivial_mask] = config.GATE_TRIVIAL_CAP
-        return pred, gate_weights
-
 
 class PortfolioPolicy(nn.Module):
     def __init__(self, hidden_dim, n_bins=6, n_extra_state=6, dropout=0.1):
@@ -336,5 +303,5 @@ class PortfolioPolicy(nn.Module):
         else:
             logits = self.head_close(x)
         if mask is not None:
-            logits = logits.masked_fill(~mask.unsqueeze(-1), -1e9)
+            logits = logits.masked_fill(~mask.unsqueeze(-1), -1e4)
         return torch.distributions.Categorical(logits=logits)

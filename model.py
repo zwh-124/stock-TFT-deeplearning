@@ -315,3 +315,16 @@ class PortfolioPolicy(nn.Module):
         if mask is not None:
             logits = logits.masked_fill(~mask.unsqueeze(-1), -1e4)
         return torch.distributions.Categorical(logits=logits)
+
+
+class ReturnPredictor(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, enc_features):
+        return self.head(enc_features).squeeze(-1)

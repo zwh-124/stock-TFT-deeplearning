@@ -1,12 +1,13 @@
 import copy
 import numpy as np
 import torch
+import torch.nn.functional as F
 import config
 from rl_utils import build_port_state
 
 
 class GRPOTrainer:
-    def __init__(self, encoder, policy, env,
+    def __init__(self, encoder, policy, env, return_predictor=None,
                  G=config.GRPO_G, beta=config.GRPO_BETA,
                  lr_policy=config.LR_POLICY, lr_encoder=config.LR_ENCODER,
                  ref_refresh_steps=config.GRPO_REF_REFRESH,
@@ -14,6 +15,7 @@ class GRPOTrainer:
         self.encoder = encoder
         self.policy = policy
         self.env = env
+        self.return_predictor = return_predictor
         self.G = G
         self.beta = beta
         self.ref_refresh_steps = ref_refresh_steps
@@ -32,6 +34,9 @@ class GRPOTrainer:
             policy.parameters(), lr=lr_policy)
         self.optimizer_encoder = torch.optim.Adam(
             encoder.parameters(), lr=lr_encoder)
+        if return_predictor is not None:
+            self.optimizer_aux = torch.optim.Adam(
+                return_predictor.parameters(), lr=lr_policy)
 
     def _maybe_refresh_ref(self):
         if self.step_count % self.ref_refresh_steps == 0 and self.step_count > 0:
@@ -52,6 +57,8 @@ class GRPOTrainer:
         trajectory_log_probs = []
         trajectory_kls = []
         noise_cache = {}
+        aux_enc_list = []
+        aux_ret_list = []
 
         for g in range(self.G):
             env_g = init_env.clone()
@@ -87,6 +94,21 @@ class GRPOTrainer:
                     if lp.dim() > 0:
                         lp = lp.mean()
                     total_log_prob = total_log_prob + lp
+
+                    if self.return_predictor is not None and g == 0:
+                        date_idx_cur = env_g.current_idx
+                        if date_idx_cur > 0:
+                            prev_close = env_g.close_prices[date_idx_cur - 1]
+                            cur_close = env_g.close_prices[date_idx_cur]
+                            stock_ret = cur_close / prev_close - 1.0
+                            valid = np.isfinite(stock_ret)
+                            if valid.any():
+                                valid_t = torch.tensor(valid, device=device)
+                                ret_t = torch.tensor(
+                                    np.nan_to_num(stock_ret, 0.0),
+                                    device=device, dtype=torch.float32)
+                                aux_enc_list.append(enc.detach()[valid_t])
+                                aux_ret_list.append(ret_t[valid_t])
 
                     with torch.no_grad():
                         with torch.amp.autocast('cuda', enabled=self.use_amp):
@@ -131,16 +153,30 @@ class GRPOTrainer:
         policy_loss = -(advantages.detach() * log_probs_t).mean()
         loss = policy_loss + self.beta * kl_avg
 
+        if self.return_predictor is not None and aux_enc_list:
+            aux_enc = torch.cat(aux_enc_list, dim=0)
+            aux_target = torch.cat(aux_ret_list, dim=0)
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                aux_pred = self.return_predictor(aux_enc)
+            aux_loss = F.mse_loss(aux_pred, aux_target)
+            loss = loss + config.LAMBDA_AUX * aux_loss
+
         self.optimizer_policy.zero_grad()
         self.optimizer_encoder.zero_grad()
+        if self.return_predictor is not None:
+            self.optimizer_aux.zero_grad()
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer_policy)
             self.scaler.unscale_(self.optimizer_encoder)
+            if self.return_predictor is not None:
+                self.scaler.unscale_(self.optimizer_aux)
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
             self.scaler.step(self.optimizer_policy)
             self.scaler.step(self.optimizer_encoder)
+            if self.return_predictor is not None:
+                self.scaler.step(self.optimizer_aux)
             self.scaler.update()
         else:
             loss.backward()
@@ -148,6 +184,8 @@ class GRPOTrainer:
             torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
             self.optimizer_policy.step()
             self.optimizer_encoder.step()
+            if self.return_predictor is not None:
+                self.optimizer_aux.step()
 
         self.step_count += 1
         return {

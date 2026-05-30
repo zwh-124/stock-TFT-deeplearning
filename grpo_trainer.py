@@ -135,10 +135,8 @@ class GRPOTrainer:
                     action = cur_dist.sample()
                     if diag_on:
                         traj_actions.append(action.detach())
-                    lp = cur_dist.log_prob(action)
-                    if lp.dim() > 0:
-                        lp = lp.mean()
-                    total_log_prob = total_log_prob + lp
+                    # #2: 先取每只股票的 log_prob，待持仓确定后再筛选累加（见下方）
+                    lp_all = cur_dist.log_prob(action)
 
                     if self.return_predictor is not None and g == 0:
                         date_idx_cur = env_g.current_idx
@@ -174,6 +172,13 @@ class GRPOTrainer:
                     w_sum = target_w.sum()
                     if w_sum > 0:
                         target_w = target_w / w_sum
+
+                    # #2: 只对实际持仓的 N_HOLD 只股票累加 log_prob，
+                    # 屏蔽掉未选中的 ~285 只股票灌进来的梯度噪声。
+                    hold_idx_t = torch.as_tensor(
+                        np.asarray(top_k_idx), device=device, dtype=torch.long)
+                    lp = lp_all[hold_idx_t].mean()
+                    total_log_prob = total_log_prob + lp
 
                     _, reward, done, _ = env_g.step(target_w)
                     if config.DIAG_SMOKE_TEST:

@@ -94,8 +94,14 @@ LAMBDA_AUX = 0.05
 LAMBDA_BENCHMARK = 0.5
 
 # ====== 诊断开关（默认不影响原算法）======
-DIAG_INTERVAL = 10       # 每多少个 update 打印一次诊断指标；设 0 关闭
+DIAG_INTERVAL = 0       # 每多少个 update 打印一次诊断指标；设 0 关闭
 DIAG_SMOKE_TEST = False  # True 时用合成奖励测试 RL 管线（需手动开启）
+
+# ====== 固定窗口贪心评估（衡量 RL 真实学习效果）======
+# 每隔 EVAL_INTERVAL 个 RL step，在一组固定的 held-out(VAL) 窗口上以贪心
+# (argmax) 方式跑策略，得到跨步可比的学习曲线，并据此(alpha)选最优模型。
+EVAL_INTERVAL = 50       # 每多少个 RL step 评估一次；设 0 关闭
+EVAL_MAX_WINDOWS = 20    # 评估用的固定窗口数（非重叠、均匀采样自 VAL 区间）
 
 # ====== Diffusion Denoiser 超参 ======
 USE_DIFFUSION_DENOISER = True

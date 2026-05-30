@@ -123,6 +123,56 @@ def plot_rl_reward_curve(reward_history, save_dir=FIGURES_DIR):
     print(f"RL reward curve saved to {path}")
 
 
+def plot_greedy_eval_curve(eval_history, save_dir=FIGURES_DIR):
+    """Plot the fixed-window greedy-eval learning curve.
+
+    eval_history: list of (step, alpha, mean_ret, episode_ir, win_rate).
+    alpha (excess vs CSI300) is the model-selection metric; this is the real
+    learning curve, unlike the per-step training reward.
+    """
+    if not eval_history:
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    arr = np.array(eval_history, dtype=np.float64)
+    steps = arr[:, 0]
+    alpha, mean_ret, ep_ir, win = arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    axes[0].plot(steps, alpha * 100, marker='o', ms=3, color='teal')
+    axes[0].axhline(0, color='gray', ls='--', lw=0.6)
+    best_i = int(np.argmax(alpha))
+    axes[0].plot(steps[best_i], alpha[best_i] * 100, marker='*', ms=14,
+                 color='red', label=f'best={alpha[best_i]*100:+.2f}%')
+    axes[0].set_xlabel('RL step')
+    axes[0].set_ylabel('Alpha vs CSI300 (%)')
+    axes[0].set_title('Greedy-Eval Alpha (selection metric)')
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(steps, mean_ret * 100, marker='o', ms=3, color='steelblue')
+    axes[1].axhline(0, color='gray', ls='--', lw=0.6)
+    axes[1].set_xlabel('RL step')
+    axes[1].set_ylabel('Mean episode return (%)')
+    axes[1].set_title('Greedy-Eval Return')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(steps, ep_ir, marker='o', ms=3, color='darkorange',
+                 label='Episode IR')
+    axes[2].plot(steps, win, marker='s', ms=3, color='green',
+                 label='Win rate')
+    axes[2].axhline(0, color='gray', ls='--', lw=0.6)
+    axes[2].set_xlabel('RL step')
+    axes[2].set_title('Greedy-Eval IR / Win rate')
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(save_dir, 'rl_greedy_eval_curve.png')
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"Greedy-eval curve saved to {path}")
+
+
 def plot_drawdown(nav_csv, save_dir=FIGURES_DIR, filename='drawdown.png'):
     """Plot drawdown curve from NAV history."""
     os.makedirs(save_dir, exist_ok=True)

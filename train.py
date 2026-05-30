@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 from model import DiffusionDenoiser
 from dataset import StockDataset
-from data_loader import build_merged_dataset
+from data_loader import build_merged_dataset, universe_tag
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from plot import plot_training_curves
@@ -139,6 +139,7 @@ def main():
             torch.save({
                 'denoiser_state': denoiser.state_dict(),
                 'config': {
+                    'UNIVERSE': universe_tag(getattr(config, 'UNIVERSE', None)),
                     'SEQ_LEN': config.SEQ_LEN,
                     'DIFFUSION_T': config.DIFFUSION_T,
                     'DIFFUSION_HIDDEN_DIM': config.DIFFUSION_HIDDEN_DIM,

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import config
-from data_loader import build_merged_dataset
+from data_loader import build_merged_dataset, universe_tag
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser, ReturnPredictor
@@ -218,6 +218,7 @@ def main():
                 "policy": policy.state_dict(),
                 "step": step,
                 "config": {
+                    'UNIVERSE': universe_tag(getattr(config, 'UNIVERSE', None)),
                     'HIDDEN_DIM': config.HIDDEN_DIM,
                     'NUM_HEADS': config.NUM_HEADS,
                     'SEQ_LEN': config.SEQ_LEN,

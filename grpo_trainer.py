@@ -89,6 +89,8 @@ class GRPOTrainer:
         aux_enc_list = []
         aux_ret_list = []
         traj_action_hashes = []  # DIAG2: 每条轨迹的动作序列哈希
+        enc_cache = {}   # #1: (date_idx, phase) -> enc，G 条轨迹复用同一编码器前向
+        mask_cache = {}  # #1: (date_idx, phase) -> mask_t（与持仓无关，可复用）
 
         for g in range(self.G):
             env_g = init_env.clone()
@@ -107,18 +109,28 @@ class GRPOTrainer:
                 date_idx = env_g.current_idx
                 for phase in ["open", "close"]:
                     env_g.phase = phase
-                    dyn_t, stat_t, mask_t = obs_cache.get_obs(
-                        date_idx, env_g, device)
-                    port_state = build_port_state(env_g, device)
-
                     cache_key = (date_idx, phase)
-                    if cache_key not in noise_cache:
-                        noise_cache[cache_key] = torch.randn_like(dyn_t)
-                    shared_noise = noise_cache[cache_key]
 
+                    # #1: encoder 前向只依赖 (date_idx, phase)，与持仓无关，
+                    # 故 G 条轨迹复用同一个 enc / mask（编码器是最贵的部分）。
+                    if cache_key in enc_cache:
+                        enc = enc_cache[cache_key]
+                        mask_t = mask_cache[cache_key]
+                    else:
+                        dyn_t, stat_t, mask_t = obs_cache.get_obs(
+                            date_idx, env_g, device)
+                        if cache_key not in noise_cache:
+                            noise_cache[cache_key] = torch.randn_like(dyn_t)
+                        shared_noise = noise_cache[cache_key]
+                        with torch.amp.autocast('cuda', enabled=self.use_amp):
+                            enc = self.encoder(dyn_t, stat_t,
+                                               denoise_noise=shared_noise)
+                        enc_cache[cache_key] = enc
+                        mask_cache[cache_key] = mask_t
+
+                    # port_state 依赖持仓，必须逐轨迹计算（policy 是廉价 MLP）。
+                    port_state = build_port_state(env_g, device)
                     with torch.amp.autocast('cuda', enabled=self.use_amp):
-                        enc = self.encoder(dyn_t, stat_t,
-                                           denoise_noise=shared_noise)
                         cur_dist = self.policy(enc, port_state, mask_t, phase)
                     action = cur_dist.sample()
                     if diag_on:

@@ -12,9 +12,18 @@ def load_basic_info():
     return df, bj_codes
 
 
-def load_csi300_codes():
+def load_index_codes(index_code):
+    """Load the latest non-empty constituent set for an index.
+
+    Args:
+        index_code: index ts_code, e.g. '000300.SH' or '399006.SZ'.
+            Matched against filenames in INDEX_WEIGHT_DIR by substring.
+
+    Returns:
+        set of con_code, or None if no matching/non-empty file found.
+    """
     iw_dir = config.INDEX_WEIGHT_DIR
-    files = sorted([f for f in os.listdir(iw_dir) if '000300' in f])
+    files = sorted([f for f in os.listdir(iw_dir) if index_code in f])
     if not files:
         return None
     for f in reversed(files):
@@ -22,6 +31,105 @@ def load_csi300_codes():
         if len(df) > 0:
             return set(df['con_code'].tolist())
     return None
+
+
+def load_csi300_codes():
+    """Backward-compatible wrapper for the legacy USE_CSI300 path."""
+    return load_index_codes('000300.SH')
+
+
+def _as_list(value):
+    """Normalize a selector value into a list."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _select_codes(selector, basic_df):
+    """Resolve a single selector dict into a set of ts_code.
+
+    Returns None for an unbounded ('all') selector, otherwise a set.
+    """
+    sel_type = selector.get('type')
+    if sel_type == 'all':
+        return None
+    if sel_type == 'index':
+        code = selector.get('code')
+        if not code:
+            raise ValueError(f"index selector missing 'code': {selector}")
+        codes = load_index_codes(code)
+        if codes is None:
+            print(f"WARNING: no constituent file found for index '{code}', "
+                  f"selector yields empty set")
+            return set()
+        return codes
+    if sel_type == 'codes':
+        return set(_as_list(selector.get('value')))
+    if sel_type in ('market', 'industry', 'area'):
+        col = sel_type
+        if col not in basic_df.columns:
+            raise ValueError(
+                f"basic.csv has no '{col}' column for selector {selector}")
+        wanted = set(_as_list(selector.get('value')))
+        if not wanted:
+            raise ValueError(f"{sel_type} selector has empty 'value': {selector}")
+        mask = basic_df[col].isin(wanted)
+        return set(basic_df.loc[mask, 'ts_code'].tolist())
+    raise ValueError(f"unknown selector type: {sel_type!r} in {selector}")
+
+
+def resolve_universe(universe, basic_df, bj_codes):
+    """Resolve a UNIVERSE spec into a stock_pool set (or None for all-market).
+
+    include selectors are unioned, then exclude selectors are subtracted.
+    An empty include list, or any 'all' selector in include, means the whole
+    market (returns None so downstream loaders skip filtering). bj_codes are
+    always removed.
+    """
+    name = universe.get('name', 'custom')
+    includes = universe.get('include', []) or []
+    excludes = universe.get('exclude', []) or []
+
+    if not includes:
+        pool = None  # empty include => all market
+    else:
+        pool = set()
+        for sel in includes:
+            sel_codes = _select_codes(sel, basic_df)
+            if sel_codes is None:  # 'all' short-circuits to whole market
+                pool = None
+                break
+            pool |= sel_codes
+
+    if pool is not None:
+        for sel in excludes:
+            ex_codes = _select_codes(sel, basic_df)
+            if ex_codes is None:
+                raise ValueError(
+                    "'all' is not a valid exclude selector "
+                    f"(would empty the universe): {sel}")
+            pool -= ex_codes
+        pool -= set(bj_codes)
+        if not pool:
+            raise ValueError(
+                f"Universe '{name}' resolved to 0 stocks; check selectors.")
+        print(f"Universe '{name}': {len(pool)} stocks")
+    else:
+        print(f"Universe '{name}': all market (no stock_pool filter)")
+    return pool
+
+
+def universe_tag(universe):
+    """Short stable identifier for a UNIVERSE spec (cache key / checkpoint)."""
+    if universe is None:
+        return None
+    name = universe.get('name')
+    payload = repr((universe.get('include', []), universe.get('exclude', [])))
+    digest = hashlib.md5(payload.encode()).hexdigest()[:8]
+    base = name if name else 'custom'
+    return f"{base}_{digest}"
 
 
 def load_st_codes():
@@ -194,7 +302,11 @@ def _data_loader_version():
 
 def build_merged_dataset(start_date=None, end_date=None):
     date_tag = f"_{start_date}_{end_date}" if start_date and end_date else ""
-    base_name = "merged_csi300" if config.USE_CSI300 else "merged_all"
+    universe = getattr(config, 'UNIVERSE', None)
+    if universe is not None:
+        base_name = f"merged_{universe_tag(universe)}"
+    else:
+        base_name = "merged_csi300" if config.USE_CSI300 else "merged_all"
     version = _data_loader_version()
     cache_name = f"{base_name}{date_tag}_{version}.pkl"
     cache_path = os.path.join(config.CACHE_DIR, cache_name)
@@ -206,12 +318,15 @@ def build_merged_dataset(start_date=None, end_date=None):
     basic_df, bj_codes = load_basic_info()
     st_codes_by_date = load_st_codes()
 
-    stock_pool = None
-    if config.USE_CSI300:
-        stock_pool = load_csi300_codes()
-        if stock_pool:
-            stock_pool = stock_pool - bj_codes
-            print(f"Using CSI300 stock pool: {len(stock_pool)} stocks")
+    if universe is not None:
+        stock_pool = resolve_universe(universe, basic_df, bj_codes)
+    else:
+        stock_pool = None
+        if config.USE_CSI300:
+            stock_pool = load_csi300_codes()
+            if stock_pool:
+                stock_pool = stock_pool - bj_codes
+                print(f"Using CSI300 stock pool: {len(stock_pool)} stocks")
 
     daily = load_daily_data(start_date, end_date, stock_pool)
     metric = load_metric_data(start_date, end_date, stock_pool)

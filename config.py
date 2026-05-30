@@ -29,7 +29,7 @@ TEST_END = "20260501"
 SEQ_LEN = 30
 PRED_HORIZON = 1
 
-HIDDEN_DIM = 64
+HIDDEN_DIM = 128
 NUM_HEADS = 4
 DROPOUT = 0.4
 LR = 5e-4
@@ -47,7 +47,7 @@ BINS = [0.0, 0.025, 0.05, 0.10, 0.15, 0.20]
 GRPO_G = 2
 GRPO_BETA = 0.04
 GRPO_REF_REFRESH = 150
-LAMBDA_TURNOVER = 1e-4
+LAMBDA_TURNOVER = 5e-5
 COMMISSION = 3e-4
 STAMP = 1e-3
 MIN_COMMISSION = 5.0
@@ -62,6 +62,16 @@ N_EXTRA_STATE = 6
 EPISODE_LEN = 10
 MAX_CASH = 150_000
 LAMBDA_CASH_PENALTY = 0.01
+
+# ====== 改进方案超参 ======
+WARMUP_EPOCHS = 5
+WARMUP_LR = 1e-3
+LAMBDA_AUX = 0.05
+LAMBDA_BENCHMARK = 0.5
+
+# ====== 诊断开关（默认不影响原算法）======
+DIAG_INTERVAL = 10       # 每多少个 update 打印一次诊断指标；设 0 关闭
+DIAG_SMOKE_TEST = False  # True 时用合成奖励测试 RL 管线（需手动开启）
 
 # ====== Diffusion Denoiser 超参 ======
 USE_DIFFUSION_DENOISER = True

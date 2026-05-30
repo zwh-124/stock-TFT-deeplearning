@@ -16,6 +16,7 @@ class AShareTradingEnv:
         self.limit_pct = limit_pct
 
         self._prepare_panel(panel_df)
+        self._load_benchmark_returns()
 
     def _prepare_panel(self, panel_df):
         self.codes = sorted(panel_df['ts_code'].unique())
@@ -55,6 +56,19 @@ class AShareTradingEnv:
         self.pre_close_prices = np.where(mask, shifted_close, self.pre_close_prices)
 
     # === PLACEHOLDER_ENV_METHODS ===
+
+    def _load_benchmark_returns(self):
+        import os
+        path = os.path.join(config.MARKET_DIR, "000300.SH.csv")
+        self.bench_returns = np.zeros(len(self.dates))
+        if not os.path.exists(path):
+            return
+        bench = pd.read_csv(path)
+        bench['trade_date'] = bench['trade_date'].astype(str)
+        bench['ret'] = bench['close'].pct_change().fillna(0)
+        ret_map = dict(zip(bench['trade_date'], bench['ret']))
+        for i, d in enumerate(self.dates):
+            self.bench_returns[i] = ret_map.get(d, 0.0)
 
     def reset(self, start_date_idx=0, episode_len=None):
         self.cash = self.init_capital
@@ -219,8 +233,12 @@ class AShareTradingEnv:
         done = episode_done or data_done
 
         self.prev_weights = target_weights.copy()
-        reward = np.log(nav_after / nav_before + 1e-10) \
-            - config.LAMBDA_TURNOVER * turnover - cash_penalty
+        portfolio_ret = np.log(nav_after / nav_before + 1e-10)
+        bench_ret = self.bench_returns[date_idx] if date_idx < len(self.bench_returns) else 0.0
+        excess = portfolio_ret - bench_ret
+        benchmark_bonus = config.LAMBDA_BENCHMARK * excess
+        reward = portfolio_ret - config.LAMBDA_TURNOVER * turnover \
+            - cash_penalty + benchmark_bonus
 
         info = {"nav": nav_after, "turnover": turnover,
                 "cash_penalty": cash_penalty}

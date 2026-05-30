@@ -3,12 +3,15 @@ import random
 import time
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 import config
 from data_loader import build_merged_dataset
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
-from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
+from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser, ReturnPredictor
+from dataset import StockDataset
 from env import AShareTradingEnv
 from grpo_trainer import GRPOTrainer
 from rl_utils import build_port_state, ObsCache
@@ -62,6 +65,42 @@ def load_denoiser(device, dynamic_dim):
         p.requires_grad = False
     print("Loaded and froze pretrained denoiser.")
     return denoiser
+
+
+def warmup_encoder(encoder, return_predictor, df, avail_features, device):
+    """方案C：用收益预测目标对encoder做几个epoch预热。"""
+    print("Warming up encoder with return prediction...")
+    train_df = df[(df['trade_date'] >= config.TRAIN_START) &
+                  (df['trade_date'] <= config.TRAIN_END)]
+    dataset = StockDataset(train_df, avail_features, STATIC_FEATURES,
+                           config.SEQ_LEN, config.PRED_HORIZON)
+    loader = DataLoader(dataset, batch_size=config.BATCH_SIZE,
+                        shuffle=True, num_workers=0)
+    encoder.train()
+    return_predictor.train()
+    opt = torch.optim.Adam(
+        list(encoder.parameters()) + list(return_predictor.parameters()),
+        lr=config.WARMUP_LR)
+    for epoch in range(config.WARMUP_EPOCHS):
+        total_loss = 0.0
+        n_batch = 0
+        for x_dyn, x_stat, y in loader:
+            x_dyn = x_dyn.to(device)
+            x_stat = x_stat.to(device)
+            y = y.to(device).float()
+            if y.dim() > 1:
+                y = y[:, 0]
+            enc_out = encoder(x_dyn, x_stat)
+            pred = return_predictor(enc_out)
+            loss = F.mse_loss(pred, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+            n_batch += 1
+        print(f"  Warmup epoch {epoch+1}/{config.WARMUP_EPOCHS} "
+              f"loss={total_loss/max(n_batch,1):.6f}")
+    print("Encoder warmup complete.")
 
 
 def randomize_portfolio_state(env, date_idx):
@@ -119,11 +158,16 @@ def main():
     if denoiser is not None:
         encoder.denoiser = denoiser
 
+    return_predictor = ReturnPredictor(config.HIDDEN_DIM).to(device)
+
+    warmup_encoder(encoder, return_predictor, df, avail_features, device)
+
     policy = PortfolioPolicy(config.HIDDEN_DIM, n_bins=config.N_BINS,
                              n_extra_state=config.N_EXTRA_STATE,
                              dropout=config.DROPOUT).to(device)
 
-    trainer = GRPOTrainer(encoder, policy, env, device=device)
+    trainer = GRPOTrainer(encoder, policy, env,
+                          return_predictor=return_predictor, device=device)
 
     train_dates = [i for i, d in enumerate(env.dates)
                    if config.TRAIN_START <= d <= config.TRAIN_END]

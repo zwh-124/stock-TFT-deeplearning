@@ -68,9 +68,11 @@ INIT_CAPITAL = 1_000_000
 # ====== RL (GRPO) 超参 ======
 N_BINS = 6
 BINS = [0.0, 0.025, 0.05, 0.10, 0.15, 0.20]
-GRPO_G = 8
+GRPO_G = 16
 GRPO_BETA = 0.04
 GRPO_REF_REFRESH = 150
+GRPO_GAMMA = 1.0         # #3: MC return-to-go 的折扣系数。1.0=纯蒙特卡洛
+                         # （总收益折合到每一步）；<1 可降低逐步优势的方差
 LAMBDA_TURNOVER = 5e-5
 COMMISSION = 3e-4
 STAMP = 1e-3

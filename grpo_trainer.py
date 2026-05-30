@@ -83,7 +83,8 @@ class GRPOTrainer:
             self._synth_alpha = np.sin(np.arange(n) * 0.7).astype(np.float32)
 
         trajectory_rewards = []
-        trajectory_log_probs = []
+        trajectory_step_rewards = []  # #3: 每条轨迹的逐步 reward 列表 [G][T]
+        trajectory_step_logps = []    # #3: 每条轨迹的逐步 log_prob 张量 [G][T]
         trajectory_kls = []
         noise_cache = {}
         aux_enc_list = []
@@ -97,7 +98,8 @@ class GRPOTrainer:
             env_g.reset(start_date_idx=start_idx,
                         episode_len=config.EPISODE_LEN)
             total_reward = 0.0
-            total_log_prob = torch.tensor(0.0, device=device)
+            step_logps = []   # #3: 本条轨迹每一步的 log_prob（保留梯度）
+            step_rewards = []  # #3: 本条轨迹每一步的即时 reward（float）
             total_kl = torch.tensor(0.0, device=device)
             n_steps = 0
             done = False
@@ -178,19 +180,21 @@ class GRPOTrainer:
                     hold_idx_t = torch.as_tensor(
                         np.asarray(top_k_idx), device=device, dtype=torch.long)
                     lp = lp_all[hold_idx_t].mean()
-                    total_log_prob = total_log_prob + lp
+                    step_logps.append(lp)  # #3: 逐步保存 log_prob（不再求和）
 
                     _, reward, done, _ = env_g.step(target_w)
                     if config.DIAG_SMOKE_TEST:
                         # 确定性合成奖励：组合权重与固定 alpha 的内积。
                         # 与动作强相关、无金融噪声，用于隔离测试管线能否学习。
                         reward = float(np.dot(target_w, self._synth_alpha))
+                    step_rewards.append(reward)  # #3: 逐步保存即时 reward
                     total_reward += reward
                     if done:
                         break
 
             trajectory_rewards.append(total_reward)
-            trajectory_log_probs.append(total_log_prob)
+            trajectory_step_rewards.append(step_rewards)
+            trajectory_step_logps.append(step_logps)
             trajectory_kls.append(total_kl / max(n_steps, 1))
 
             if diag_on and traj_actions:
@@ -199,16 +203,39 @@ class GRPOTrainer:
 
         rewards_t = torch.tensor(trajectory_rewards, device=device,
                                  dtype=torch.float32)
-        reward_std = rewards_t.std()
-        if reward_std < 1e-6:
-            advantages = torch.zeros_like(rewards_t)
-        else:
-            advantages = (rewards_t - rewards_t.mean()) / (reward_std + 1e-8)
-
-        log_probs_t = torch.stack(trajectory_log_probs)
         kl_avg = torch.stack(trajectory_kls).mean()
 
-        policy_loss = -(advantages.detach() * log_probs_t).mean()
+        # #3: 蒙特卡洛 return-to-go + 逐步组内基线 + 逐步 loss。
+        # G 条轨迹日期/phase 进程一致，步数相同；取最小公共长度以防边界。
+        gamma = config.GRPO_GAMMA
+        T = min(len(sr) for sr in trajectory_step_rewards)
+        if T == 0:
+            policy_loss = torch.tensor(0.0, device=device)
+            advantages = torch.zeros(self.G, 1, device=device)
+        else:
+            # 每条轨迹的 return-to-go（后缀折扣和）：G_t 只含 t 及之后的奖励
+            returns_mat = torch.zeros(self.G, T, device=device,
+                                      dtype=torch.float32)
+            for g in range(self.G):
+                sr = trajectory_step_rewards[g]
+                acc = 0.0
+                for t in range(T - 1, -1, -1):
+                    acc = sr[t] + gamma * acc
+                    returns_mat[g, t] = acc
+
+            # 逐步组内基线：在每个时间步 t 上跨 G 条轨迹做 z-score
+            mean_t = returns_mat.mean(dim=0, keepdim=True)
+            std_t = returns_mat.std(dim=0, keepdim=True)
+            advantages = (returns_mat - mean_t) / (std_t + 1e-8)
+            advantages = torch.where(std_t < 1e-6,
+                                     torch.zeros_like(advantages), advantages)
+
+            # 逐步 loss：每步优势配各自的 log_prob（#2 的逐股均值已含其中）
+            logp_mat = torch.stack(
+                [torch.stack(trajectory_step_logps[g][:T])
+                 for g in range(self.G)])
+            policy_loss = -(advantages.detach() * logp_mat).mean()
+
         loss = policy_loss + self.beta * kl_avg
 
         aux_loss_val = 0.0

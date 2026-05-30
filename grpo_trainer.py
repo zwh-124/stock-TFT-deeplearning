@@ -84,7 +84,8 @@ class GRPOTrainer:
 
         trajectory_rewards = []
         trajectory_step_rewards = []  # #3: 每条轨迹的逐步 reward 列表 [G][T]
-        trajectory_step_logps = []    # #3: 每条轨迹的逐步 log_prob 张量 [G][T]
+        trajectory_step_logps = []    # #4: 每条轨迹的逐步 per-stock log_prob [G][T][N_HOLD]
+        trajectory_step_stock_returns = []  # #4: 每条轨迹的逐步 per-stock 收益 [G][T][N_HOLD]
         trajectory_kls = []
         noise_cache = {}
         aux_enc_list = []
@@ -98,8 +99,9 @@ class GRPOTrainer:
             env_g.reset(start_date_idx=start_idx,
                         episode_len=config.EPISODE_LEN)
             total_reward = 0.0
-            step_logps = []   # #3: 本条轨迹每一步的 log_prob（保留梯度）
+            step_logps = []   # #4: 本条轨迹每一步的 per-stock log_prob [N_HOLD]
             step_rewards = []  # #3: 本条轨迹每一步的即时 reward（float）
+            step_stock_returns = []  # #4: 本条轨迹每一步的 per-stock 收益 [N_HOLD]
             total_kl = torch.tensor(0.0, device=device)
             n_steps = 0
             done = False
@@ -175,19 +177,23 @@ class GRPOTrainer:
                     if w_sum > 0:
                         target_w = target_w / w_sum
 
-                    # #2: 只对实际持仓的 N_HOLD 只股票累加 log_prob，
-                    # 屏蔽掉未选中的 ~285 只股票灌进来的梯度噪声。
+                    # #4: 保留每只持仓股的 log_prob（不再 .mean()），
+                    # 用于 per-stock 截面优势的逐股梯度分配。
                     hold_idx_t = torch.as_tensor(
                         np.asarray(top_k_idx), device=device, dtype=torch.long)
-                    lp = lp_all[hold_idx_t].mean()
-                    step_logps.append(lp)  # #3: 逐步保存 log_prob（不再求和）
+                    lp_per_stock = lp_all[hold_idx_t]  # [N_HOLD]
+                    step_logps.append(lp_per_stock)
 
-                    _, reward, done, _ = env_g.step(target_w)
+                    _, reward, done, info = env_g.step(target_w)
+                    # #4: 收集 per-stock 实现收益（用于截面优势）
+                    per_stock_ret = info.get('per_stock_returns',
+                                            np.zeros(env_g.n_stocks))
+                    held_returns = per_stock_ret[top_k_idx]  # [N_HOLD]
                     if config.DIAG_SMOKE_TEST:
-                        # 确定性合成奖励：组合权重与固定 alpha 的内积。
-                        # 与动作强相关、无金融噪声，用于隔离测试管线能否学习。
                         reward = float(np.dot(target_w, self._synth_alpha))
-                    step_rewards.append(reward)  # #3: 逐步保存即时 reward
+                        held_returns = self._synth_alpha[top_k_idx]
+                    step_stock_returns.append(held_returns)
+                    step_rewards.append(reward)
                     total_reward += reward
                     if done:
                         break
@@ -195,6 +201,7 @@ class GRPOTrainer:
             trajectory_rewards.append(total_reward)
             trajectory_step_rewards.append(step_rewards)
             trajectory_step_logps.append(step_logps)
+            trajectory_step_stock_returns.append(step_stock_returns)
             trajectory_kls.append(total_kl / max(n_steps, 1))
 
             if diag_on and traj_actions:
@@ -205,15 +212,16 @@ class GRPOTrainer:
                                  dtype=torch.float32)
         kl_avg = torch.stack(trajectory_kls).mean()
 
-        # #3: 蒙特卡洛 return-to-go + 逐步组内基线 + 逐步 loss。
-        # G 条轨迹日期/phase 进程一致，步数相同；取最小公共长度以防边界。
+        # #4: per-stock 截面优势 + return-to-go 时间优势叠加。
+        # 解决原 #3 的核心缺陷：同一步所有持仓股共享标量优势，无法区分个股贡献。
         gamma = config.GRPO_GAMMA
         T = min(len(sr) for sr in trajectory_step_rewards)
+        N_HOLD_actual = config.N_HOLD
         if T == 0:
             policy_loss = torch.tensor(0.0, device=device)
-            advantages = torch.zeros(self.G, 1, device=device)
+            advantages = torch.zeros(self.G, 1, N_HOLD_actual, device=device)
         else:
-            # 每条轨迹的 return-to-go（后缀折扣和）：G_t 只含 t 及之后的奖励
+            # --- A_temporal: [G, T] return-to-go 跨 G 轨迹 z-score ---
             returns_mat = torch.zeros(self.G, T, device=device,
                                       dtype=torch.float32)
             for g in range(self.G):
@@ -223,14 +231,34 @@ class GRPOTrainer:
                     acc = sr[t] + gamma * acc
                     returns_mat[g, t] = acc
 
-            # 逐步组内基线：在每个时间步 t 上跨 G 条轨迹做 z-score
-            mean_t = returns_mat.mean(dim=0, keepdim=True)
-            std_t = returns_mat.std(dim=0, keepdim=True)
-            advantages = (returns_mat - mean_t) / (std_t + 1e-8)
-            advantages = torch.where(std_t < 1e-6,
-                                     torch.zeros_like(advantages), advantages)
+            mean_g = returns_mat.mean(dim=0, keepdim=True)
+            std_g = returns_mat.std(dim=0, keepdim=True)
+            A_temporal = (returns_mat - mean_g) / (std_g + 1e-8)
+            A_temporal = torch.where(std_g < 1e-6,
+                                     torch.zeros_like(A_temporal), A_temporal)
+            # 扩展到 [G, T, N_HOLD]（每只持仓股共享时间维度优势）
+            A_temporal = A_temporal.unsqueeze(-1).expand(-1, -1, N_HOLD_actual)
 
-            # 逐步 loss：每步优势配各自的 log_prob（#2 的逐股均值已含其中）
+            # --- A_cross: [G, T, N_HOLD] 截面优势，跨持仓股 z-score ---
+            stock_ret_mat = torch.zeros(self.G, T, N_HOLD_actual,
+                                        device=device, dtype=torch.float32)
+            for g in range(self.G):
+                for t in range(T):
+                    stock_ret_mat[g, t] = torch.tensor(
+                        trajectory_step_stock_returns[g][t],
+                        device=device, dtype=torch.float32)
+
+            cross_mean = stock_ret_mat.mean(dim=-1, keepdim=True)
+            cross_std = stock_ret_mat.std(dim=-1, keepdim=True) + 1e-8
+            A_cross = (stock_ret_mat - cross_mean) / cross_std
+            A_cross = torch.where(cross_std < 1e-6,
+                                  torch.zeros_like(A_cross), A_cross)
+
+            # --- 叠加 ---
+            alpha = config.ALPHA_TEMPORAL
+            advantages = alpha * A_temporal + (1 - alpha) * A_cross
+
+            # logp_mat: [G, T, N_HOLD]（每只股票独立的 log_prob）
             logp_mat = torch.stack(
                 [torch.stack(trajectory_step_logps[g][:T])
                  for g in range(self.G)])

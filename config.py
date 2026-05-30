@@ -57,7 +57,7 @@ HIDDEN_DIM = 128
 NUM_HEADS = 4
 DROPOUT = 0.4
 LR = 5e-4
-EPOCHS = 300
+EPOCHS = 200
 BATCH_SIZE = 2048
 PATIENCE = 25
 
@@ -94,6 +94,7 @@ WARMUP_EPOCHS = 5
 WARMUP_LR = 1e-3
 LAMBDA_AUX = 0.05
 LAMBDA_BENCHMARK = 0.5
+ALPHA_TEMPORAL = 0.3   # 时间维度优势的混合权重（截面优势权重 = 1 - ALPHA_TEMPORAL）
 
 # ====== 诊断开关（默认不影响原算法）======
 DIAG_INTERVAL = 0       # 每多少个 update 打印一次诊断指标；设 0 关闭

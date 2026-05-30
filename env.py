@@ -218,9 +218,21 @@ class AShareTradingEnv:
         turnover = (np.abs(target_weights - self.prev_weights)).sum()
 
         if self.phase == "open":
+            future_prices = self.close_prices[date_idx]
+            per_stock_returns = np.where(
+                ~np.isnan(prices) & ~np.isnan(future_prices) & (prices > 0),
+                future_prices / prices - 1.0, 0.0).astype(np.float32)
             nav_after = self._compute_nav()
             self.phase = "close"
         else:
+            next_idx = date_idx + 1
+            if next_idx < len(self.dates):
+                future_prices = self.open_prices[next_idx]
+                per_stock_returns = np.where(
+                    ~np.isnan(prices) & ~np.isnan(future_prices) & (prices > 0),
+                    future_prices / prices - 1.0, 0.0).astype(np.float32)
+            else:
+                per_stock_returns = np.zeros(self.n_stocks, dtype=np.float32)
             nav_after = self._compute_nav()
             self.current_idx += 1
             self.phase = "open"
@@ -241,7 +253,8 @@ class AShareTradingEnv:
             - cash_penalty + benchmark_bonus
 
         info = {"nav": nav_after, "turnover": turnover,
-                "cash_penalty": cash_penalty}
+                "cash_penalty": cash_penalty,
+                "per_stock_returns": per_stock_returns}
         return self._get_state() if not done else None, reward, done, info
 
     def _force_reduce_cash(self, prices, can_buy):

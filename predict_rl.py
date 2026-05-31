@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 
 import config
-from data_loader import build_merged_dataset
+from data_loader import build_merged_dataset, universe_tag
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser
@@ -50,6 +50,11 @@ def main():
 
     if 'config' in ckpt:
         saved_cfg = ckpt['config']
+        saved_univ = saved_cfg.get('UNIVERSE')
+        cur_univ = universe_tag(getattr(config, 'UNIVERSE', None))
+        if saved_univ is not None and saved_univ != cur_univ:
+            print(f"WARNING: universe mismatch — "
+                  f"trained={saved_univ}, current={cur_univ}")
         for key, cur in {'HIDDEN_DIM': config.HIDDEN_DIM,
                          'SEQ_LEN': config.SEQ_LEN,
                          'NUM_HEADS': config.NUM_HEADS,

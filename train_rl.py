@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import config
-from data_loader import build_merged_dataset
+from data_loader import build_merged_dataset, universe_tag
 from feature_engine import build_features, DYNAMIC_FEATURES, STATIC_FEATURES
 from feature_engine import STATIC_CATEGORICAL, STATIC_CONTINUOUS
 from model import TFTEncoder, PortfolioPolicy, DiffusionDenoiser, ReturnPredictor
@@ -15,7 +15,9 @@ from dataset import StockDataset
 from env import AShareTradingEnv
 from grpo_trainer import GRPOTrainer
 from rl_utils import build_port_state, ObsCache
-from plot import plot_rl_reward_curve
+from plot import plot_rl_reward_curve, plot_greedy_eval_curve
+from greedy_eval import build_eval_windows, evaluate_greedy
+from backtest_rl import load_benchmark_close_map
 
 
 SEED = 42
@@ -179,12 +181,46 @@ def main():
     grouped = df.sort_values('trade_date').groupby('ts_code')
     obs_cache = ObsCache(grouped, avail_features, env, seq_len)
 
+    # 固定窗口贪心评估：在 held-out(VAL) 区间取一组固定窗口，构成可跨步比较的学习曲线
+    eval_starts = build_eval_windows(
+        env, config.VAL_START, config.VAL_END, seq_len,
+        config.EPISODE_LEN, config.EVAL_MAX_WINDOWS)
+    eval_close_map = load_benchmark_close_map()
+    if config.EVAL_INTERVAL > 0:
+        print(f"Greedy eval: {len(eval_starts)} fixed VAL windows "
+              f"every {config.EVAL_INTERVAL} steps.")
+
     print(f"RL training for {config.RL_STEPS} episodes "
           f"({len(valid_starts)} valid starts)...")
     print("Training encoder + policy end-to-end with GRPO from scratch.")
-    best_reward = -np.inf
+    best_alpha = -np.inf
     reward_history = []
+    eval_history = []  # (step, excess_mean, mean_ret, episode_ir, win_rate)
     t_start = time.time()
+
+    def save_best(step):
+        save_path = os.path.join(config.CACHE_DIR, "best_rl_policy.pt")
+        os.makedirs(config.CACHE_DIR, exist_ok=True)
+        torch.save({
+            "encoder": encoder.state_dict(),
+            "policy": policy.state_dict(),
+            "step": step,
+            "config": {
+                'UNIVERSE': universe_tag(getattr(config, 'UNIVERSE', None)),
+                'HIDDEN_DIM': config.HIDDEN_DIM,
+                'NUM_HEADS': config.NUM_HEADS,
+                'SEQ_LEN': config.SEQ_LEN,
+                'DROPOUT': config.DROPOUT,
+                'N_BINS': config.N_BINS,
+                'BINS': config.BINS,
+                'N_HOLD': config.N_HOLD,
+                'N_EXTRA_STATE': config.N_EXTRA_STATE,
+                'EPISODE_LEN': config.EPISODE_LEN,
+                'MAX_CASH': config.MAX_CASH,
+                'USE_DIFFUSION_DENOISER': config.USE_DIFFUSION_DENOISER,
+                'DYNAMIC_FEATURES': avail_features,
+            },
+        }, save_path)
 
     for step in range(config.RL_STEPS):
         start_idx = random.choice(valid_starts)
@@ -207,38 +243,33 @@ def main():
                   f"kl={metrics['kl']:.4f} | "
                   f"{speed:.2f} ep/s | ETA {eta/60:.1f}min")
 
-        window = reward_history[-100:]
-        avg_reward = np.mean(window)
-        if len(reward_history) >= 100 and avg_reward > best_reward:
-            best_reward = avg_reward
-            save_path = os.path.join(config.CACHE_DIR, "best_rl_policy.pt")
-            os.makedirs(config.CACHE_DIR, exist_ok=True)
-            torch.save({
-                "encoder": encoder.state_dict(),
-                "policy": policy.state_dict(),
-                "step": step,
-                "config": {
-                    'HIDDEN_DIM': config.HIDDEN_DIM,
-                    'NUM_HEADS': config.NUM_HEADS,
-                    'SEQ_LEN': config.SEQ_LEN,
-                    'DROPOUT': config.DROPOUT,
-                    'N_BINS': config.N_BINS,
-                    'BINS': config.BINS,
-                    'N_HOLD': config.N_HOLD,
-                    'N_EXTRA_STATE': config.N_EXTRA_STATE,
-                    'EPISODE_LEN': config.EPISODE_LEN,
-                    'MAX_CASH': config.MAX_CASH,
-                    'USE_DIFFUSION_DENOISER': config.USE_DIFFUSION_DENOISER,
-                    'DYNAMIC_FEATURES': avail_features,
-                },
-            }, save_path)
+        # 固定窗口贪心评估：跨步可比的学习曲线，并据 alpha(excess_mean) 选最优
+        if (config.EVAL_INTERVAL > 0 and eval_starts and
+                step % config.EVAL_INTERVAL == 0):
+            em = evaluate_greedy(encoder, policy, env, obs_cache, device,
+                                 eval_starts, eval_close_map)
+            if em is not None:
+                alpha = em['excess_mean']
+                eval_history.append((step, alpha, em['mean_ret'],
+                                     em['episode_ir'], em['win_rate']))
+                tag = ""
+                if alpha > best_alpha:
+                    best_alpha = alpha
+                    save_best(step)
+                    tag = "  <- best"
+                print(f"  [EVAL step {step}] alpha(excess)={alpha*100:+.3f}%  "
+                      f"ret={em['mean_ret']*100:+.3f}%  "
+                      f"IR={em['episode_ir']:.3f}  "
+                      f"beat={em['beat_bench_rate']*100:.0f}%  "
+                      f"win={em['win_rate']*100:.0f}%{tag}")
 
-    print(f"Training done. Best avg reward (100-step): {best_reward:.6f}")
+    print(f"Training done. Best greedy-eval alpha: {best_alpha*100:+.3f}%")
     total_time = time.time() - t_start
     print(f"Total training time: {total_time/60:.1f} min "
           f"({total_time/config.RL_STEPS:.2f} s/episode)")
     print(f"Model saved to {os.path.join(config.CACHE_DIR, 'best_rl_policy.pt')}")
     plot_rl_reward_curve(reward_history)
+    plot_greedy_eval_curve(eval_history)
 
 
 if __name__ == "__main__":

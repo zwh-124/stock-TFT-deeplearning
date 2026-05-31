@@ -15,7 +15,31 @@ BASIC_CSV = os.path.join(DATA_ROOT, "basic.csv")
 MARKET_DIR = os.path.join(DATA_ROOT, "market")
 INDEX_WEIGHT_DIR = os.path.join(DATA_ROOT, "index_weight")
 
+# ====== 股票池选择 ======
+# 旧开关，向后兼容：仅当 UNIVERSE 为 None 时生效
 USE_CSI300 = True
+
+# 新的可组合选股规格。非 None 时优先于 USE_CSI300 生效。
+# 语义：include 各选择器结果取并集得到候选池，再减去 exclude 的并集。
+# 北交所 / ST 始终被强制剔除（见 data_loader.filter_stocks），与此处无关。
+#
+# 选择器类型：
+#   {"type": "index",    "code": "000300.SH"}         指数成分（可用 000300.SH / 399006.SZ）
+#   {"type": "market",   "value": "主板"}             按板块（主板/创业板/科创板/北交所），value 可为 str 或 list
+#   {"type": "industry", "value": ["银行", "半导体"]}  按行业，value 可为 str 或 list
+#   {"type": "area",     "value": "深圳"}             按地域，value 可为 str 或 list
+#   {"type": "codes",    "value": ["600519.SH"]}      按显式代码列表
+#   {"type": "all"}                                    全市场（include 为空亦视为全市场）
+#
+# 示例与各设置下大致股票数见 docs/UNIVERSE.md。设为 None 则回退到 USE_CSI300。
+UNIVERSE = {
+    "name": "csi300",
+    "include": [
+        {"type": "index", "code": "000300.SH"},
+    ],
+    "exclude": [],
+}
+
 IPO_SKIP_DAYS = 40
 STATIC_EMBED_DIM = 16
 
@@ -33,7 +57,7 @@ HIDDEN_DIM = 128
 NUM_HEADS = 4
 DROPOUT = 0.4
 LR = 5e-4
-EPOCHS = 100
+EPOCHS = 200
 BATCH_SIZE = 2048
 PATIENCE = 25
 
@@ -44,9 +68,11 @@ INIT_CAPITAL = 1_000_000
 # ====== RL (GRPO) 超参 ======
 N_BINS = 6
 BINS = [0.0, 0.025, 0.05, 0.10, 0.15, 0.20]
-GRPO_G = 2
+GRPO_G = 16
 GRPO_BETA = 0.04
 GRPO_REF_REFRESH = 150
+GRPO_GAMMA = 1.0         # #3: MC return-to-go 的折扣系数。1.0=纯蒙特卡洛
+                         # （总收益折合到每一步）；<1 可降低逐步优势的方差
 LAMBDA_TURNOVER = 5e-5
 COMMISSION = 3e-4
 STAMP = 1e-3
@@ -68,10 +94,17 @@ WARMUP_EPOCHS = 5
 WARMUP_LR = 1e-3
 LAMBDA_AUX = 0.05
 LAMBDA_BENCHMARK = 0.5
+ALPHA_TEMPORAL = 0.3   # 时间维度优势的混合权重（截面优势权重 = 1 - ALPHA_TEMPORAL）
 
 # ====== 诊断开关（默认不影响原算法）======
-DIAG_INTERVAL = 10       # 每多少个 update 打印一次诊断指标；设 0 关闭
+DIAG_INTERVAL = 0       # 每多少个 update 打印一次诊断指标；设 0 关闭
 DIAG_SMOKE_TEST = False  # True 时用合成奖励测试 RL 管线（需手动开启）
+
+# ====== 固定窗口贪心评估（衡量 RL 真实学习效果）======
+# 每隔 EVAL_INTERVAL 个 RL step，在一组固定的 held-out(VAL) 窗口上以贪心
+# (argmax) 方式跑策略，得到跨步可比的学习曲线，并据此(alpha)选最优模型。
+EVAL_INTERVAL = 50       # 每多少个 RL step 评估一次；设 0 关闭
+EVAL_MAX_WINDOWS = 20    # 评估用的固定窗口数（非重叠、均匀采样自 VAL 区间）
 
 # ====== Diffusion Denoiser 超参 ======
 USE_DIFFUSION_DENOISER = True

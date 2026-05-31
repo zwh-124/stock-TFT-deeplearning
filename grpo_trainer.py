@@ -83,19 +83,25 @@ class GRPOTrainer:
             self._synth_alpha = np.sin(np.arange(n) * 0.7).astype(np.float32)
 
         trajectory_rewards = []
-        trajectory_log_probs = []
+        trajectory_step_rewards = []  # #3: 每条轨迹的逐步 reward 列表 [G][T]
+        trajectory_step_logps = []    # #4: 每条轨迹的逐步 per-stock log_prob [G][T][N_HOLD]
+        trajectory_step_stock_returns = []  # #4: 每条轨迹的逐步 per-stock 收益 [G][T][N_HOLD]
         trajectory_kls = []
         noise_cache = {}
         aux_enc_list = []
         aux_ret_list = []
         traj_action_hashes = []  # DIAG2: 每条轨迹的动作序列哈希
+        enc_cache = {}   # #1: (date_idx, phase) -> enc，G 条轨迹复用同一编码器前向
+        mask_cache = {}  # #1: (date_idx, phase) -> mask_t（与持仓无关，可复用）
 
         for g in range(self.G):
             env_g = init_env.clone()
             env_g.reset(start_date_idx=start_idx,
                         episode_len=config.EPISODE_LEN)
             total_reward = 0.0
-            total_log_prob = torch.tensor(0.0, device=device)
+            step_logps = []   # #4: 本条轨迹每一步的 per-stock log_prob [N_HOLD]
+            step_rewards = []  # #3: 本条轨迹每一步的即时 reward（float）
+            step_stock_returns = []  # #4: 本条轨迹每一步的 per-stock 收益 [N_HOLD]
             total_kl = torch.tensor(0.0, device=device)
             n_steps = 0
             done = False
@@ -107,26 +113,34 @@ class GRPOTrainer:
                 date_idx = env_g.current_idx
                 for phase in ["open", "close"]:
                     env_g.phase = phase
-                    dyn_t, stat_t, mask_t = obs_cache.get_obs(
-                        date_idx, env_g, device)
-                    port_state = build_port_state(env_g, device)
-
                     cache_key = (date_idx, phase)
-                    if cache_key not in noise_cache:
-                        noise_cache[cache_key] = torch.randn_like(dyn_t)
-                    shared_noise = noise_cache[cache_key]
 
+                    # #1: encoder 前向只依赖 (date_idx, phase)，与持仓无关，
+                    # 故 G 条轨迹复用同一个 enc / mask（编码器是最贵的部分）。
+                    if cache_key in enc_cache:
+                        enc = enc_cache[cache_key]
+                        mask_t = mask_cache[cache_key]
+                    else:
+                        dyn_t, stat_t, mask_t = obs_cache.get_obs(
+                            date_idx, env_g, device)
+                        if cache_key not in noise_cache:
+                            noise_cache[cache_key] = torch.randn_like(dyn_t)
+                        shared_noise = noise_cache[cache_key]
+                        with torch.amp.autocast('cuda', enabled=self.use_amp):
+                            enc = self.encoder(dyn_t, stat_t,
+                                               denoise_noise=shared_noise)
+                        enc_cache[cache_key] = enc
+                        mask_cache[cache_key] = mask_t
+
+                    # port_state 依赖持仓，必须逐轨迹计算（policy 是廉价 MLP）。
+                    port_state = build_port_state(env_g, device)
                     with torch.amp.autocast('cuda', enabled=self.use_amp):
-                        enc = self.encoder(dyn_t, stat_t,
-                                           denoise_noise=shared_noise)
                         cur_dist = self.policy(enc, port_state, mask_t, phase)
                     action = cur_dist.sample()
                     if diag_on:
                         traj_actions.append(action.detach())
-                    lp = cur_dist.log_prob(action)
-                    if lp.dim() > 0:
-                        lp = lp.mean()
-                    total_log_prob = total_log_prob + lp
+                    # #2: 先取每只股票的 log_prob，待持仓确定后再筛选累加（见下方）
+                    lp_all = cur_dist.log_prob(action)
 
                     if self.return_predictor is not None and g == 0:
                         date_idx_cur = env_g.current_idx
@@ -163,17 +177,31 @@ class GRPOTrainer:
                     if w_sum > 0:
                         target_w = target_w / w_sum
 
-                    _, reward, done, _ = env_g.step(target_w)
+                    # #4: 保留每只持仓股的 log_prob（不再 .mean()），
+                    # 用于 per-stock 截面优势的逐股梯度分配。
+                    hold_idx_t = torch.as_tensor(
+                        np.asarray(top_k_idx), device=device, dtype=torch.long)
+                    lp_per_stock = lp_all[hold_idx_t]  # [N_HOLD]
+                    step_logps.append(lp_per_stock)
+
+                    _, reward, done, info = env_g.step(target_w)
+                    # #4: 收集 per-stock 实现收益（用于截面优势）
+                    per_stock_ret = info.get('per_stock_returns',
+                                            np.zeros(env_g.n_stocks))
+                    held_returns = per_stock_ret[top_k_idx]  # [N_HOLD]
                     if config.DIAG_SMOKE_TEST:
-                        # 确定性合成奖励：组合权重与固定 alpha 的内积。
-                        # 与动作强相关、无金融噪声，用于隔离测试管线能否学习。
                         reward = float(np.dot(target_w, self._synth_alpha))
+                        held_returns = self._synth_alpha[top_k_idx]
+                    step_stock_returns.append(held_returns)
+                    step_rewards.append(reward)
                     total_reward += reward
                     if done:
                         break
 
             trajectory_rewards.append(total_reward)
-            trajectory_log_probs.append(total_log_prob)
+            trajectory_step_rewards.append(step_rewards)
+            trajectory_step_logps.append(step_logps)
+            trajectory_step_stock_returns.append(step_stock_returns)
             trajectory_kls.append(total_kl / max(n_steps, 1))
 
             if diag_on and traj_actions:
@@ -182,16 +210,60 @@ class GRPOTrainer:
 
         rewards_t = torch.tensor(trajectory_rewards, device=device,
                                  dtype=torch.float32)
-        reward_std = rewards_t.std()
-        if reward_std < 1e-6:
-            advantages = torch.zeros_like(rewards_t)
-        else:
-            advantages = (rewards_t - rewards_t.mean()) / (reward_std + 1e-8)
-
-        log_probs_t = torch.stack(trajectory_log_probs)
         kl_avg = torch.stack(trajectory_kls).mean()
 
-        policy_loss = -(advantages.detach() * log_probs_t).mean()
+        # #4: per-stock 截面优势 + return-to-go 时间优势叠加。
+        # 解决原 #3 的核心缺陷：同一步所有持仓股共享标量优势，无法区分个股贡献。
+        gamma = config.GRPO_GAMMA
+        T = min(len(sr) for sr in trajectory_step_rewards)
+        N_HOLD_actual = config.N_HOLD
+        if T == 0:
+            policy_loss = torch.tensor(0.0, device=device)
+            advantages = torch.zeros(self.G, 1, N_HOLD_actual, device=device)
+        else:
+            # --- A_temporal: [G, T] return-to-go 跨 G 轨迹 z-score ---
+            returns_mat = torch.zeros(self.G, T, device=device,
+                                      dtype=torch.float32)
+            for g in range(self.G):
+                sr = trajectory_step_rewards[g]
+                acc = 0.0
+                for t in range(T - 1, -1, -1):
+                    acc = sr[t] + gamma * acc
+                    returns_mat[g, t] = acc
+
+            mean_g = returns_mat.mean(dim=0, keepdim=True)
+            std_g = returns_mat.std(dim=0, keepdim=True)
+            A_temporal = (returns_mat - mean_g) / (std_g + 1e-8)
+            A_temporal = torch.where(std_g < 1e-6,
+                                     torch.zeros_like(A_temporal), A_temporal)
+            # 扩展到 [G, T, N_HOLD]（每只持仓股共享时间维度优势）
+            A_temporal = A_temporal.unsqueeze(-1).expand(-1, -1, N_HOLD_actual)
+
+            # --- A_cross: [G, T, N_HOLD] 截面优势，跨持仓股 z-score ---
+            stock_ret_mat = torch.zeros(self.G, T, N_HOLD_actual,
+                                        device=device, dtype=torch.float32)
+            for g in range(self.G):
+                for t in range(T):
+                    stock_ret_mat[g, t] = torch.tensor(
+                        trajectory_step_stock_returns[g][t],
+                        device=device, dtype=torch.float32)
+
+            cross_mean = stock_ret_mat.mean(dim=-1, keepdim=True)
+            cross_std = stock_ret_mat.std(dim=-1, keepdim=True) + 1e-8
+            A_cross = (stock_ret_mat - cross_mean) / cross_std
+            A_cross = torch.where(cross_std < 1e-6,
+                                  torch.zeros_like(A_cross), A_cross)
+
+            # --- 叠加 ---
+            alpha = config.ALPHA_TEMPORAL
+            advantages = alpha * A_temporal + (1 - alpha) * A_cross
+
+            # logp_mat: [G, T, N_HOLD]（每只股票独立的 log_prob）
+            logp_mat = torch.stack(
+                [torch.stack(trajectory_step_logps[g][:T])
+                 for g in range(self.G)])
+            policy_loss = -(advantages.detach() * logp_mat).mean()
+
         loss = policy_loss + self.beta * kl_avg
 
         aux_loss_val = 0.0

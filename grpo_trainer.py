@@ -126,9 +126,23 @@ class GRPOTrainer:
                         if cache_key not in noise_cache:
                             noise_cache[cache_key] = torch.randn_like(dyn_t)
                         shared_noise = noise_cache[cache_key]
-                        with torch.amp.autocast('cuda', enabled=self.use_amp):
-                            enc = self.encoder(dyn_t, stat_t,
-                                               denoise_noise=shared_noise)
+                        enc_bs = getattr(config, 'ENCODER_BATCH_SIZE', 0)
+                        n_stocks = dyn_t.shape[0]
+                        if enc_bs > 0 and n_stocks > enc_bs:
+                            enc_parts = []
+                            for _i in range(0, n_stocks, enc_bs):
+                                _end = min(_i + enc_bs, n_stocks)
+                                with torch.amp.autocast('cuda',
+                                                        enabled=self.use_amp):
+                                    enc_parts.append(self.encoder(
+                                        dyn_t[_i:_end], stat_t[_i:_end],
+                                        denoise_noise=shared_noise[_i:_end]))
+                            enc = torch.cat(enc_parts, dim=0)
+                        else:
+                            with torch.amp.autocast('cuda',
+                                                    enabled=self.use_amp):
+                                enc = self.encoder(dyn_t, stat_t,
+                                                   denoise_noise=shared_noise)
                         enc_cache[cache_key] = enc
                         mask_cache[cache_key] = mask_t
 

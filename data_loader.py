@@ -355,6 +355,16 @@ def build_merged_dataset(start_date=None, end_date=None):
 
     merged = filter_stocks(merged, bj_codes, st_codes_by_date)
 
+    top_n = getattr(config, 'UNIVERSE_TOP_N', None)
+    if top_n and 'amount' in merged.columns:
+        avg_amount = merged.groupby('ts_code')['amount'].mean()
+        top_codes = set(avg_amount.nlargest(top_n).index)
+        before_n = merged['ts_code'].nunique()
+        merged = merged[merged['ts_code'].isin(top_codes)]
+        after_n = merged['ts_code'].nunique()
+        print(f"Liquidity filter: top {top_n} by avg amount, "
+              f"{before_n} -> {after_n} stocks")
+
     # 过滤新股上市初期数据（前 IPO_SKIP_DAYS 个交易日）
     list_date_map = dict(zip(basic_df['ts_code'],
                              basic_df['list_date'].astype(str)))

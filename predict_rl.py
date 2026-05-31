@@ -144,7 +144,16 @@ def main():
         port_state = build_port_state(env, device)
 
         with torch.no_grad():
-            enc = encoder(dyn_t, stat_t)
+            enc_bs = getattr(config, 'ENCODER_BATCH_SIZE', 0)
+            n_stocks = dyn_t.shape[0]
+            if enc_bs > 0 and n_stocks > enc_bs:
+                enc_parts = []
+                for _i in range(0, n_stocks, enc_bs):
+                    _end = min(_i + enc_bs, n_stocks)
+                    enc_parts.append(encoder(dyn_t[_i:_end], stat_t[_i:_end]))
+                enc = torch.cat(enc_parts, dim=0)
+            else:
+                enc = encoder(dyn_t, stat_t)
             dist = policy(enc, port_state, mask_t, phase)
             action = dist.probs.argmax(dim=-1)
 
